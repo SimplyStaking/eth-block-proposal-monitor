@@ -1,0 +1,12 @@
+{
+    "port": 7999,
+    "eth2_rpc": "",
+    "reward_metrics": true,
+    "eth1_rpc": "",
+    "parallel_requests": true,
+    "keys_file": "pubkeys.txt",
+    "continue_from_last_slot": true,
+    "last_slot": 0,
+    "pruning": false,
+    "keep_last_slots": 100
+}

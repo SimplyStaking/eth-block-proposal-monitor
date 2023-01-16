@@ -1,0 +1,7 @@
+prometheus_client
+rlp
+eth_typing
+eth_utils
+ethereum
+requests>=2.25
+urllib3>=1.26
