@@ -24,14 +24,14 @@ If you're on Linux, you can follow these commands to create a user and run the s
 ```bash
 # create the non-root user
 adduser monitoring --disabled-login
-# install python3 with pip
+# install python3 with pip
 sudo apt-get update -y && sudo apt-get install python3-pip -y
 
 # as the user, clone the repository
 su monitoring
 cd
 git clone https://github.com/SimplyVC/eth-block-proposal-monitor
-cd eth-block-monitor
+cd eth-block-proposal-monitor
 
 # install the requirements using pip
 pip3 install -r requirements.txt
@@ -41,9 +41,9 @@ pip3 install -r requirements.txt
 exit
 
 # as root, make the setup script executable
-chmod +x /home/monitoring/eth-block-monitor/setup.sh
+chmod +x /home/monitoring/eth-block-proposal-monitor/setup.sh
 # run the script and check the logs of the service file to ensure it is working fine
-/home/monitoring/eth-block-monitor/setup.sh && journalctl -f -u eth2_block_monitoring
+/home/monitoring/eth-block-proposal-monitor/setup.sh && journalctl -f -u eth2_block_monitoring
 ```
 
 ### Config File
