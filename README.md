@@ -30,7 +30,7 @@ sudo apt-get update -y && sudo apt-get install python3-pip -y
 # as the user, clone the repository
 su monitoring
 cd
-git clone <link>
+git clone https://github.com/SimplyVC/eth-block-proposal-monitor
 cd eth-block-monitor
 
 # install the requirements using pip
