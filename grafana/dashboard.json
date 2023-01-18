@@ -679,7 +679,7 @@
       "targets": [
         {
           "exemplar": true,
-          "expr": "increase(RelayBlocksProposed{relay=\"None\"}[10m])",
+          "expr": "increase(RelayBlocksProposed{relay=\"Unknown\"}[10m])",
           "interval": "",
           "legendFormat": "{{public_key}}",
           "refId": "A"
