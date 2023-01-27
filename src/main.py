@@ -497,24 +497,6 @@ def reward_extraction(slot=None, block=None) -> float:
         s.mount('http://', HTTPAdapter(max_retries=retries))
         block = s.get(config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot), timeout=10).json()
 
-    fee_recipient = block['data']['message']['body']['execution_payload']['fee_recipient']
-    transactions = block['data']['message']['body']['execution_payload']['transactions']
-
-    # try to find the reward transaction, by checking the last transaction first
-    tx_decoded = tx_hash_to_dict(transactions[-1])
-    value = match_transaction(fee_recipient, tx_decoded)
-    if value != -1:
-        return value
-    else:
-        # if it wasn't the last transaction, try all the other transactions
-        for tx in transactions[:-1]:
-            value = match_transaction(fee_recipient, tx_hash_to_dict(tx))
-            if value != -1:
-                return value
-    
-    # transaction was not found, try other methods
-    print("Reward transaction error at slot "+block['data']['message']['slot']+" - reward transaction not found.")
-
     # if we could not get the transaction, then calculate manually
     if parallel_requests:
         value = calculate_rewards_parallel(int(block['data']['message']['body']['execution_payload']['block_number']), config["eth1_rpc"])

@@ -1,7 +1,5 @@
-import rlp
 from eth_typing import HexStr
 from eth_utils import to_bytes
-from ethereum.transactions import Transaction
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from threading import Thread
@@ -25,28 +23,6 @@ def hex_to_bytes(data: str) -> bytes:
         The hexadecimal string as bytes
     """
     return to_bytes(hexstr=HexStr(data))
-
-def tx_hash_to_dict(tx: str) -> dict:
-    """
-    Converts a transaction object hash / hex to a dictionary
-
-    Parameters:
-    -----------
-    tx : str
-        The transaction object as hexadecimal
-
-    Returns:
-    -----------
-    dict
-        The hexadecimal transaction object decoded as a dict
-    """
-    try:
-        # try to decode
-        tx = rlp.decode(hex_to_bytes(tx), Transaction)
-        return tx.to_dict()
-    except Exception as e:
-        # if there was an error, return an empty dictionary
-        return {}
 
 def match_transaction(recipient: str, transaction) -> float:
     """
