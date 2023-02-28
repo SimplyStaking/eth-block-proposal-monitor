@@ -1,6 +1,7 @@
 import requests
 import json
 import time
+import codecs
 from helper_funcs import *
 from db_ops import *
 from prometheus_client.core import CollectorRegistry, GaugeMetricFamily, REGISTRY, CounterMetricFamily, Gauge
@@ -267,6 +268,543 @@ def check_duties(slot):
     # if we failed and cannot get range for user, return -1
     return -1
 
+def get_current_slot() -> int:
+    """
+    Gets the latest slot number from the Beacon Chain RPC
+
+    Returns:
+    --------
+    int
+        The latest slot number
+    """
+    global config
+
+    # get current slot
+    s = requests.Session()
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+
+    # try to return the slot number as an integer
+    try:
+        data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/headers", timeout=60).json()
+        return int(data['data'][0]['header']['message']['slot'])
+    except Exception as e:
+        raise Exception("Failed to get current slot (get_current_slot()): "+e)
+
+def get_validator_indexes(public_keys: list) -> dict:
+    """
+    Gets the indexes of the validators from their public key using the Beacon Chain RPC
+
+    Returns:
+    --------
+    dict
+        A dict where the key is the public key of the validator and the value is the validator's index
+    """
+
+    # get current slot first
+    curr_slot = get_current_slot()
+    
+    key_index = {}
+
+    for key in public_keys:
+        # get the index for each validator
+        index = get_validator_index(curr_slot, key)
+        key_index[key] = index
+    
+    return key_index
+
+def get_validator_indexes_parallel(public_keys: list) -> dict:
+    """
+    Same functionality as get_validator_indexes(), but performs RPC calls parallelly
+
+    Returns:
+    --------
+    dict
+        A dict where the key is the public key of the validator and the value is the validator's index
+    """
+    global config, retries
+
+    # get current slot first
+    curr_slot = get_current_slot()
+
+    # create the class of the worker
+    class Worker(Thread):
+        def __init__(self, key_queue):
+            Thread.__init__(self)
+            self.queue = key_queue
+            self.results = []
+        
+        def run(self):
+            # keep running until it finds an empty string
+            while True:
+                # get the next key in the queue
+                key = self.queue.get()
+                if key == "":
+                    break
+                try:
+                    s = requests.Session()
+                    s.mount('http://', HTTPAdapter(max_retries=retries))
+
+                    # try to get the validator index
+                    data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/"+str(curr_slot)+"/validators/"+key, timeout=30).json()
+                    data = data['data']['index']
+
+                    # if we got it, append it as a dict where the key is the public key, and the value is the index
+                    self.results.append({key: data})
+                    self.queue.task_done()
+                except Exception as e:
+                    print("ETH2 request failed - get_validator_indexes_parallel(): "+e)
+                    self.results.append({key: None})
+                    self.queue.task_done()
+    
+    num_workers = 50
+    q = Queue()
+
+    # add each key in the queue
+    for key in public_keys:
+        q.put(key)
+
+    # add empty strings which will tell the workers that they're done
+    for _ in range(num_workers * 2):
+        q.put("")
+
+    workers = []
+
+    # create the workers
+    for _ in range(num_workers):
+        worker = Worker(q)
+        worker.start()
+        workers.append(worker)
+
+    # get the results
+    for worker in workers:
+        worker.join()
+
+    # store the results in an array
+    results = []
+    for worker in workers:
+        results.extend(worker.results)
+
+    results_dict = {}
+
+    # go over each dict
+    for dict in results:
+        for key, value in dict.items():
+            # if the request failed, try again
+            if value is None:
+                results_dict[key] = get_validator_index(curr_slot, key)
+            else:
+                results_dict[key] = value
+
+    return results_dict
+
+def get_validator_index(slot: int, key: str) -> int:
+    """
+    Performs an RPC call to get the index of the validator given its public key
+
+    Parameters:
+    -----------
+    slot : int
+        The slot number at which to check - more recent slot numbers usually results in a quicker response
+    key : str
+        The public key of the validator
+
+    Returns:
+    --------
+    int
+        The index of the validator
+    """
+    global config, retries
+
+    s = requests.Session()
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+    
+    # attempt the request
+    try:
+        data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/"+str(slot)+"/validators/"+key, timeout=60).json()
+        return data['data']['index']
+    except Exception as e:
+        raise Exception("Failed to get validator index (get_validator_index()): "+e)
+
+def sync_committee_hex_to_bits(hex: str) -> list:
+    """
+    Converts the sync committee participation hexadecimal returned by the Beacon Chain RPC to bits
+
+    Parameters:
+    -----------
+    hex : str / hex
+        The sync committee participation hex
+
+    Returns:
+    --------
+    list
+        The participation bits as a list of 1s and 0s
+    """
+    # convert the hex to bytes - removing the 0x at the start
+    byte_data = codecs.decode(re.sub("0x", "", hex), "hex")
+
+    # check that we have 512 bits (since we converted to bytes, 1 byte = 8 bits), the size of the sync committee
+    if len(byte_data) * 8 != 512:
+        raise Exception("Length of sync committee hex is "+str(len(byte_data) * 8)+" bits, expected length is 512.")
+
+    # create array to hold bits
+    bits = []
+
+    # iterate over the data to set bit values
+    for i in range(len(byte_data) * 8):
+        # get the byte that the bit is in
+        byte = byte_data[i // 8]
+        
+        # set the bit that we want to check as 1
+        # so if we want to check the 5th (i=4) bit, this would create a 00001000 byte
+        test_byte = 1 << (i % 8)
+
+        # do bitwise AND, which will result in a value greater than 1 if the bit we are checking is 1
+        # example, bitwise AND of 10101100 & 00001000 results in 00001000 (decimal value of 8) because the 5th bit is 1 in both
+        # whereas, bitwise AND of 11100111 & 00001000 results in 00000000 (decimal value of 0) because the 5th bit is 0 in the first byte
+        # we are checking for the original byte (from byte_data), and only using test_byte to see if it is 1 or 0
+        result = byte & test_byte
+        
+        # if result > 0 (i.e. any byte that is not 00000000), append a 1, otherwise 0
+        bits.append(1 if result > 0 else 0)
+
+    return bits
+
+def check_sync_committee(validator_indexes: list, curr_slot: int = 0):
+    """
+    Populates the global variables with the current sync committee info
+
+    Parameters:
+    -----------
+    validator_indexes : list
+        A list of the validator indexes of our validators
+    curr_slot : int
+        The current slot
+    """
+    global config, retries, prev_sync_committee, curr_sync_committee, next_sync_committee, curr_sync_start_epoch, next_sync_start_epoch, val_sync_participated_gauge, val_sync_missed_gauge, validators_index_key_mappings, current_sync_committee_epoch_gauge
+
+    # remove old committee metrics
+    for val_index in prev_sync_committee:
+        try:
+            val_sync_participated_gauge.remove(validators_index_key_mappings[val_index], curr_sync_start_epoch-256)
+            val_sync_missed_gauge.remove(validators_index_key_mappings[val_index], curr_sync_start_epoch-256)
+            current_sync_committee_epoch_gauge.remove(curr_sync_start_epoch-256)
+        except:
+            print("Failed to remove old committee metrics (check_sync_committee()).")
+
+    # check if we have a slot number, otherwise get it
+    if curr_slot == 0:
+        curr_slot = get_current_slot()
+
+    # calculate the first epoch of this committee and the next epoch of the next committee from the slot number
+    curr_sync_start_epoch = ((curr_slot // 32) // 256) * 256
+    next_sync_start_epoch = curr_sync_start_epoch + 256
+
+    # update current and past start epoch metrics
+    current_sync_committee_epoch_gauge.labels(curr_sync_start_epoch-256).set(0)
+    current_sync_committee_epoch_gauge.labels(curr_sync_start_epoch).set(1)
+    
+    # get the sync committees
+    if curr_sync_committee != {}:
+        # if this is not the first time setting these variables, set the past committee as the current
+        prev_sync_committee = curr_sync_committee
+    else:
+        # if this is the first time setting these variables, get the past committee as well
+        prev_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch-256)
+    curr_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch)
+    next_sync_committee = get_validator_committee_index(validator_indexes, next_sync_start_epoch)
+
+    # initialise the metrics for the current committee to 0
+    for val_index in curr_sync_committee:
+        val_sync_participated_gauge.labels(validators_index_key_mappings[val_index], curr_sync_start_epoch).set(0)
+        val_sync_missed_gauge.labels(validators_index_key_mappings[val_index], curr_sync_start_epoch).set(0)
+
+def check_sync_performance_slot(slot: int = 0, slot_data: dict = {}) -> dict:
+    """
+    Calculates the performance of the validators in the committee for a given slot
+
+    Parameters:
+    -----------
+    slot : int
+        The slot number of the slot to check performance for. This parameter is ignored if slot_data is provided.
+    slot_data : dict
+        The JSON format of the data returned by the Beacon Chain RPC when requesting a slot. This parameter is optional if slot is provided.
+
+    Returns:
+    --------
+    dict
+        Returns a dict where the key is the index of the validator and the value is whether it participated in the slot or not
+    """
+    global curr_sync_committee
+    
+    # check that at least one parameter was passed
+    if slot == 0 and slot_data == {}:
+        raise Exception("At least one parameter must be passed (check_sync_performance_slot()).")
+
+    # get the sync committee participation bits as hex
+    hex = get_slot_sync_committee_bits(slot, slot_data)
+
+    # check if slot is missed first (0x0)
+    if hex == "0x0":
+        return {}
+
+    # convert the hex to bits
+    bits = sync_committee_hex_to_bits(hex)
+
+    performance = {}
+
+    for val_index, sync_index in curr_sync_committee.items():
+        # if the value of the committee bits at the validator's sync committee index is 1, then it participated - otherwise it missed
+        performance[val_index] = bits[sync_index] == 1
+
+    return performance
+
+def check_sync_performance_epoch(epoch: int) -> dict:
+    """
+    Calculates the performance of the validators in the committee for a given epoch
+
+    Parameters:
+    -----------
+    epoch : int
+        The epoch to check the performance at
+
+    Returns:
+    --------
+    dict
+        A dict where the key is the index of the validator and the value is a dict containing:
+            'Participated': the number of blocks the validator participated in
+            'Missed': the number of blocks the validator did not participate in
+            'MissedBlock': the number of missed blocks - the validator could not participate
+    """
+    global curr_sync_committee
+
+    # check if epoch is in the future
+    curr_slot = get_current_slot()
+    curr_epoch = curr_slot // 32
+
+    if epoch > curr_epoch:
+        raise Exception("Cannot get sync performance for epoch which is in the future. The current epoch is "+str(curr_epoch)+", whereas the epoch requested is "+str(epoch)+".")
+
+    # calculate first slot of requested epoch
+    i = epoch * 32
+
+    # check until which slot to check - either the first slot of the next epoch, or the current slot - to avoid querying for future slots
+    last_slot = (epoch + 1) * 32 if (curr_slot + 1) > ((epoch + 1) * 32) else (curr_slot + 1)
+
+    # store results in a dict
+    validators_performance = {}
+
+    # initialise values
+    for validator in curr_sync_committee.keys():
+        validators_performance[validator] = {
+                    'Participated': 0,
+                    'Missed': 0,
+                    'MissedBlock': 0
+                }
+
+    # iterate over slots
+    while i < last_slot:
+        curr_performance = check_sync_performance_slot(i)
+
+        # check if slot is missed
+        if curr_performance == {}:
+            for validator in curr_sync_committee.keys():
+                validators_performance[validator]['MissedBlock'] += 1
+        else:
+            for val_index, result in curr_performance.items():
+                if result:
+                    validators_performance[val_index]['Participated'] += 1
+                else:
+                    validators_performance[val_index]['Missed'] += 1
+        
+        # move to next slot
+        i += 1
+
+    return validators_performance
+
+def update_sync_committee_performance(slot: int = 0, slot_data: dict = {}):
+    """
+    Checks and updates the sync committee performance for the validators we are monitoring that are in the sync committee
+
+    Parameters:
+    -----------
+    slot : int
+        The slot to check performance at. Parameter is ignored if slot_data is provided.
+    slot_data : dict
+        The JSON format as returned by the Beacon Chain RPC when requesting a slot. Parameter is optional as long as slot is provided.
+    """
+    global validators_index_key_mappings, curr_sync_committee
+
+    # if the current committee does not include any of our validators, return
+    if curr_sync_committee == {}:
+        return
+
+    # make sure at least one parameter was passed
+    if slot == 0 and slot_data == {}:
+        raise Exception("At least one parameter must be passed (update_sync_committee_performance()).")
+
+    # get performance for slot
+    if slot_data != {}:
+        performance = check_sync_performance_slot(slot_data=slot_data)
+    else:
+        performance = check_sync_performance_slot(slot=slot)
+
+    # convert index to public key
+    new_performance = {}
+    for key, value in performance.items():
+        new_performance[validators_index_key_mappings[key]] = value
+
+    # update metrics
+    update_sync_committee_metrics(new_performance)
+
+    # insert in database
+    if slot_data != {}:
+        insert_sync_committee_performance(int(slot_data['data']['message']['slot']), performance)
+    else:
+        insert_sync_committee_performance(slot, performance)
+
+def update_sync_committee_metrics(key_performance_mappings: dict):
+    """
+    Updates the sync committee metrics according to the passed parameter
+
+    Parameters:
+    -----------
+    key_performance_mappings : dict
+        A dict where the key is the public key of the validator and the value is whether it participated or not in the sync committee
+    """
+    global val_sync_participated_gauge, val_sync_missed_gauge, curr_sync_start_epoch
+
+    for key, value in key_performance_mappings.items():
+        # if it participated, increment the 'participated' metric by 1, otherwise increment the 'missed' metric by 1
+        if value:
+            val_sync_participated_gauge.labels(key, curr_sync_start_epoch).inc(1)
+        else:
+            val_sync_missed_gauge.labels(key, curr_sync_start_epoch).inc(1)
+
+def set_sync_committee_metrics(participated: dict, missed: dict, epoch: int):
+    """
+    Sets the sync committee metrics to a given value
+
+    Parameters:
+    -----------
+    participated : dict
+        A dict where the key is the public key of the validator and the value is an integer indicating in how many blocks it participated
+        in the sync committee for the given start epoch
+    missed : dict
+        A dict where the key is the public key of the validator and the value is an integer indicating how many blocks it missed in the
+        sync committee for the given start epoch
+    epoch : int
+        The starting epoch of the sync committee
+    """
+    global val_sync_participated_gauge, val_sync_missed_gauge
+
+    for key, value in participated.items():
+        val_sync_participated_gauge.labels(key, epoch).set(value)
+    
+    for key, value in missed.items():
+        val_sync_missed_gauge.labels(key, epoch).set(value)
+
+def get_validator_committee_index(validator_indexes: list, epoch: int) -> dict:
+    """
+    Gets the position (index) of the validators in the committee sync. This is used to know which bit corresponds to it.
+
+    Parameters:
+    -----------
+    validator_indexes : list
+        A list of the indexes of the validators to look for
+    epoch : int
+        The epoch at which to get the sync committee
+
+    Returns:
+    --------
+    dict
+        Returns a dict where the key is the index of the validator and the value is its position in the sync committee
+    """
+    global config, retries
+
+    # get the sync committee
+    s = requests.Session()
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+
+    try:
+        data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/finalized/sync_committees?epoch="+str(epoch), timeout=60).json()
+        
+        # convert sync committee validator indexes to int so we can compare
+        sync_committee = list(map(int, data['data']['validators']))
+        validator_sync_index_mapping = {}
+        
+        # keep a counter for the position in the committee
+        i = 0
+
+        for index in sync_committee:
+            # if we found one of our validators, save the position they're in
+            if index in validator_indexes:
+                validator_sync_index_mapping[index] = i
+            i += 1
+
+        return validator_sync_index_mapping
+
+    except Exception as e:
+        raise Exception("Failed to get validator committee indexes (get_validator_committee_index()): "+e)
+
+def get_slot(slot: int) -> dict:
+    """
+    Given a slot number, it returns the corresponding slot by using an RPC
+
+    Parameters:
+    -----------
+    slot : int
+        The slot number
+
+    Returns:
+    --------
+    dict
+        The slot as returned by the RPC
+    """
+    global config, retries
+
+    # get the slot
+    s = requests.Session()
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+    try:
+        data = s.get(config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot)).json()
+        if 'code' in data:
+            if data['code'] == 500:
+                raise Exception("Error from node while getting slot "+str(slot)+"\n"+data['message'])
+    except Exception as e:
+        raise Exception("Failed to get slot (get_slot()): "+e)
+
+    # return the slot
+    return data
+
+def get_slot_sync_committee_bits(slot: int = 0, slot_data: dict = {}) -> str:
+    """
+    Given a slot number, it returns the sync committee bits as hex
+
+    Parameters:
+    -----------
+    slot : int
+        The slot number
+
+    Returns:
+    --------
+    str / hex
+        The sync committee bits as returned by the RPC
+    """
+    # check that at least one parameter was passed
+    if slot == 0 and slot_data == {}:
+        raise Exception("At least one parameter has to be passed (get_slot_sync_committee_bits()).")
+
+    if slot_data == {}:
+        # get the slot
+        slot_data = get_slot(slot)
+
+    # return the hex
+    try:
+        return slot_data['data']['message']['body']['sync_aggregate']['sync_committee_bits']
+    except:
+        # block is missed - return 0x0
+        return "0x0"
+
 
 def check_if_empty(slot):
     """
@@ -282,20 +820,15 @@ def check_if_empty(slot):
     bool
         Whether the block is empty (True) or not (False)
     """
-    global config, retries
-
+    # get the transactions in the given block
+    block = get_slot(slot)
     try:
-        # get the transactions in the given block
-        s = requests.Session()
-        s.mount('http://', HTTPAdapter(max_retries=retries))
-        block = s.get(config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot), timeout=10).json()
         txs = block["data"]["message"]["body"]["execution_payload"]["transactions"]
-
-        # if there are none, then it is empty
-        return len(txs) == 0
     except:
-        print("Request failed: "+ config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot))
-        return False 
+        return False
+
+    # if there are none, then it is empty
+    return len(txs) == 0
 
 def update_metrics(data, reward=None):
     """
@@ -313,6 +846,8 @@ def update_metrics(data, reward=None):
         if data["missed"]:
             # if we missed the block, update the metric
             increment_missed_blocks(data["proposer"])
+            if data["empty"]:
+                increment_empty_blocks(data["proposer"])
         elif data["empty"]:
             # if the block is empty, update the metric
             increment_empty_blocks(data["proposer"])
@@ -486,18 +1021,16 @@ def reward_extraction(slot=None, block=None) -> float:
     float
         The reward value in ETH
     """
-    global config, retries, parallel_requests
+    global config, parallel_requests
 
     if slot is None and block is None:
         print('At least one argument must be passed.')
     
     # if block was not passed, get it using the rpc
     if slot is not None and block is None:
-        s = requests.Session()
-        s.mount('http://', HTTPAdapter(max_retries=retries))
-        block = s.get(config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot), timeout=10).json()
+        block = get_slot(slot)
 
-    # if we could not get the transaction, then calculate manually
+    # calculate reward manually
     if parallel_requests:
         value = calculate_rewards_parallel(int(block['data']['message']['body']['execution_payload']['block_number']), config["eth1_rpc"])
     else:
@@ -522,12 +1055,10 @@ def get_non_relayed_slot(slot):
     float
         The reward value of the slot in ETH
     """
-    global config, relay_config, retries, reward_metrics
+    global config, relay_config, retries, reward_metrics, sync_committee_metrics
 
     # get the block using a beacon-chain RPC
-    s = requests.Session()
-    s.mount('http://', HTTPAdapter(max_retries=retries))
-    block = s.get(config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot), timeout=10).json()
+    block = get_slot(slot)
 
     # by default, the relay value is unknown
     relay_value = "Unknown"
@@ -561,15 +1092,21 @@ def get_non_relayed_slot(slot):
         
         # get the validator public key
         proposer_index = block["data"]["message"]["proposer_index"]
+        s = requests.Session()
+        s.mount('http://', HTTPAdapter(max_retries=retries))
         validator = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/head/validators/"+str(proposer_index)).json()
         
+        # if we're tracking sync committee participation, update metrics
+        if sync_committee_metrics:
+            update_sync_committee_performance(slot_data=block)
+
         # build the slot object
         data = {
             "slot": slot,
             "proposer": validator["data"]["validator"]["pubkey"],
             "relay": relay_value,
             "missed": False,
-            "empty": check_if_empty(slot)
+            "empty": len(block["data"]["message"]["body"]["execution_payload"]["transactions"]) == 0
         }
     except:
         # otherwise, block is missed / empty
@@ -714,12 +1251,15 @@ config = json.load(f)
 # are we tracking rewards?
 reward_metrics = config["reward_metrics"]
 
+# are we tracking sync committee participation?
+sync_committee_metrics = config["sync_committee_participation"]
+
 # should requests to the ETH1 RPC be parallel?
-parallel_requests = config["parallel_requests"]
+parallel_requests = config["parallel_requests_eth1"]
 
 # check if we have a db
 if isfile(dirname(__file__)+'/../data/slot_data.db'):
-    data = populate_data_obj()
+    data = update_db()
 else:
     data = initialise_db()
 
@@ -759,6 +1299,41 @@ with open(dirname(__file__)+'/../config/'+config["keys_file"], 'r') as fp:
     keys = unique
     print('Total keys:', len(keys))
 
+if sync_committee_metrics:
+    # check if we have added the validator index column in the validators' table
+    if not validator_index_exists():
+        # if validator index table is not present, then we have to create and fill column
+        print("Fetching validator indexes, this process might take a while depending on your RPC client and whether parallel requests are enabled.")
+        if config["parallel_requests_eth2"]:
+            insert_validator_indexes(get_validator_indexes_parallel(keys))
+        else:
+            insert_validator_indexes(get_validator_indexes(keys))
+        print("Validator indexes gathered and stored in database.")
+    else:
+        # if we have the validator index column, check that we have the validator index for ALL validators in the db
+        vals_without_index = get_validators_without_indexes()
+
+        if len(vals_without_index) > 0:
+            # get the validator indexes for those without index
+            print("Fetching validator indexes for "+str(len(vals_without_index))+" validators. This process might take a while depending on your RPC client and whether parallel requests are enabled.")
+            if config["parallel_requests_eth2"]:
+                insert_validator_indexes(get_validator_indexes_parallel(vals_without_index))
+            else:
+                insert_validator_indexes(get_validator_indexes(vals_without_index))
+            print("Validator indexes gathered and stored in database.")
+
+    # store validator indexes - public key mappings
+    validators_index_key_mappings = get_validator_indexes_pub_key_mappings()
+
+    # keeping track of sync committees
+    prev_sync_committee = {}
+    curr_sync_committee = {}
+    next_sync_committee = {}
+
+    # also keep track of when the current committee starts and ends
+    curr_sync_start_epoch = 0
+    next_sync_start_epoch = 0
+
 # for retrying requests
 retries = Retry(total=10, backoff_factor=0.005, status_forcelist=[500, 503, 504], allowed_methods=frozenset(['GET', 'POST']))
 
@@ -784,6 +1359,12 @@ if __name__ == '__main__':
         val_avg_reward_gauge = Gauge("AvgValidatorRewards", 'Average Reward per block by each realyer by the validators we are monitoring', ["relay"], registry=collector)
         val_unknown_reward_blocks = Gauge("ValUnknownRewardBlocks", 'Total Number of blocks with an unknown reward proposed by the validators we are monitoring', ["relay"], registry=collector)
 
+    # committee sync metrics
+    if sync_committee_metrics:
+        val_sync_participated_gauge = Gauge("ValidatorSyncParticipated", 'Total number of participations in current sync committee by validator.', ["public_key", "epoch"], registry=collector)
+        val_sync_missed_gauge = Gauge("ValidatorSyncMissed", 'Total number of missed participations in current sync committee by validator.', ["public_key", "epoch"], registry=collector)
+        current_sync_committee_epoch_gauge = Gauge("CurrentSyncCommitteeEpoch", 'Label contains the epoch at which the committee sync started. Value is 1 if it is the current committee and 0 otherwise.', ["epoch"], registry=collector)
+
     REGISTRY.register(collector)
 
     # initialise metric values
@@ -796,6 +1377,24 @@ while True:
 
     for slot in slots:
         if slot["slot"] > data_obj["last_slot"]:
+            # first check that we have initialised sync committee variables
+            if sync_committee_metrics:
+                if curr_sync_start_epoch == 0:
+                    curr_slot = data_obj["last_slot"] + 1 if (data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1) else slot["slot"]
+                    check_sync_committee(list(validators_index_key_mappings.keys()), curr_slot)
+
+                    # see if we have any values in the database for the past committee
+                    participated, missed = get_sync_committee_performance_between_slots((curr_sync_start_epoch-256)*32, (curr_sync_start_epoch*32)-1)
+
+                    if participated != {}:
+                        set_sync_committee_metrics(participated, missed, curr_sync_start_epoch-256)
+
+                    # see if we have any values in the database for the current committee
+                    participated, missed = get_sync_committee_performance_between_slots(curr_sync_start_epoch*32, (next_sync_start_epoch*32)-1)
+
+                    if participated != {}:
+                        set_sync_committee_metrics(participated, missed, curr_sync_start_epoch)
+
             # if we skipped slots - get data manually through rpc
             if data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1:
                 # get the missing slots
@@ -803,6 +1402,11 @@ while True:
                 for i in range(missing_slot_count - 1):
                     missing_slot = data_obj["last_slot"]+i+1
                     print("Missing slot", missing_slot)
+
+                    # check if we've reached the end epoch and need to update variables
+                    if sync_committee_metrics:
+                        if missing_slot == next_sync_start_epoch * 32 or missing_slot > next_sync_start_epoch * 32:
+                            check_sync_committee(list(validators_index_key_mappings.keys()), missing_slot)
 
                     # get slot and reward value, and update metrics
                     data, reward = get_non_relayed_slot(missing_slot)
@@ -818,14 +1422,23 @@ while True:
                         update_reward_metrics(data["relay"], reward)
                     data_obj["slots"].append(data)
 
+            # check if we've reached the end epoch and need to update variables
+            if sync_committee_metrics:
+                if slot["slot"] == next_sync_start_epoch * 32 or slot["slot"] > next_sync_start_epoch * 32:
+                    check_sync_committee(list(validators_index_key_mappings.keys()), slot["slot"])
+
             # if slot is in relayer data, fill in data
             data = {
                 "slot": slot["slot"],
                 "proposer": slot["proposer_pubkey"] if "proposer_pubkey" in slot else slot["proposer"],
                 "relay": slot["relay"],
                 "missed": False,
-                "empty": check_if_empty(slot["slot"])
+                "empty": False if (slot["value"] / 1000000000000000000) > 0.0 else check_if_empty(slot["slot"])
             }
+
+            # if we're tracking sync committee participation, update metrics
+            if sync_committee_metrics:
+                update_sync_committee_performance(slot=slot["slot"])
 
             # reward value is in slot data, divide to get ETH value
             reward = slot["value"] / 1000000000000000000

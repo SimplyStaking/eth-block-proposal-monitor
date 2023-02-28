@@ -18,6 +18,19 @@ def initialise_db():
     insert_relayers()
     return populate_data_obj()
 
+def update_db():
+    """
+    Inserts any missing relayers and validators in the database without re-creating it
+
+    Returns:
+    --------
+    obj
+        The data object used by the main function that has the slots and the various metrics
+    """
+    insert_validators()
+    insert_relayers()
+    return populate_data_obj()
+
 def create_db():
     """
     Creates the database in which the data is stored
@@ -58,6 +71,31 @@ def create_db():
     con.commit()
     con.close()
 
+def validator_exists(pub_key: str) -> bool:
+    """
+    Checks if a validator exists in the database
+
+    Parameters:
+    -----------
+    pub_key : str
+        The public key of the validator to check for
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT COUNT(*)
+    FROM validators
+    WHERE public_key = ?
+    """, (pub_key,))
+
+    if cur.fetchone()[0] > 0:
+        con.close()
+        return True
+
+    con.close()
+    return False
+
 def insert_validators():
     """
     Reads the file containing the public keys of the validators and inserts them into the database
@@ -76,10 +114,37 @@ def insert_validators():
     cur = con.cursor()
 
     for key in keys:
-        cur.execute('INSERT OR IGNORE INTO validators(public_key) VALUES(?)', (key,))
+        key = key.replace('\n','').replace('\r','')
+        if not validator_exists(key):
+            cur.execute('INSERT OR IGNORE INTO validators(public_key) VALUES(?)', (key,))
 
     con.commit()
     con.close()
+
+def relayer_exists(endpoint: str) -> bool:
+    """
+    Checks if a relayer exists in the database
+
+    Parameters:
+    -----------
+    endpoint : str
+        The endpoint of the relayer to check for
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT COUNT(*)
+    FROM relayers
+    WHERE endpoint = ?
+    """, (endpoint,))
+
+    if cur.fetchone()[0] > 0:
+        con.close()
+        return True
+
+    con.close()
+    return False
 
 def insert_relayers():
     """
@@ -95,10 +160,12 @@ def insert_relayers():
     cur = con.cursor()
 
     for key, value in relay_config.items():
-        cur.execute('INSERT OR IGNORE INTO relayers(name, endpoint) VALUES (?, ?)', (key, value,))
+        if not relayer_exists(value):
+            cur.execute('INSERT OR IGNORE INTO relayers(name, endpoint) VALUES (?, ?)', (key, value,))
 
     # also insert 'Unknown'
-    cur.execute('INSERT OR IGNORE INTO relayers(name, endpoint) VALUES (?, ?)', ('Unknown', 'N/A'))
+    if not relayer_exists('N/A'):
+        cur.execute('INSERT OR IGNORE INTO relayers(name, endpoint) VALUES (?, ?)', ('Unknown', 'N/A'))
 
     con.commit()
     con.close()
@@ -1089,3 +1156,322 @@ def get_metrics_from_db():
         metrics['ValUnknownRewardBlocks'] = get_validator_unknown_reward_blocks()
 
     return metrics
+
+def validator_index_exists() -> bool:
+    """
+    Checks if the validator table has a validator index column
+
+    Returns:
+    --------
+    bool
+        True if there is a validator index column, False otherwise
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    # if the row has 3 values, then the column exists
+    cur.execute("""
+    SELECT * FROM validators
+    ORDER BY ROWID ASC LIMIT 1
+    """)
+
+    return len(cur.fetchone()) == 3
+
+def add_validator_index():
+    """
+    Adds the validator index column to the validators table
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    cur.execute("""
+    ALTER TABLE validators
+    ADD COLUMN val_index INTEGER
+    """)
+
+    con.commit()
+    con.close()
+
+def insert_validator_indexes(key_index_mapping: dict):
+    """
+    Adds validator indexes to the validators table
+
+    Parameters:
+    -----------
+    key_index_mapping : dict
+        A dict where the key is the public key of the validator, and the value is its validator index
+    """
+    if not validator_index_exists():
+        add_validator_index()
+
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    # add the validator index to each validator
+    for key, index in key_index_mapping.items():
+        cur.execute('UPDATE validators SET val_index = ? WHERE public_key = ?', (index, key))
+
+    con.commit()
+    con.close()
+
+def get_validator_indexes_db() -> list:
+    """
+    Gets the validator indexes from the database
+
+    Returns:
+    --------
+    list
+        A list of validator indexes
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT val_index
+    FROM validators
+    WHERE val_index IS NOT NULL
+    """)
+
+    result = cur.fetchall()
+    results_combined = []
+
+    if len(result) > 0:
+        for row in result:
+            results_combined.append(row[0])
+    
+    con.close()
+    return results_combined
+
+def get_validator_indexes_pub_key_mappings() -> dict:
+    """
+    Gets the validators' public keys and validator indexes
+
+    Returns:
+    --------
+    dict
+        A dict where the key is the validator's index and the value is its public key
+    """
+
+    sql = """
+    SELECT val_index, public_key
+    FROM validators
+    WHERE val_index IS NOT NULL
+    """
+
+    return execute_query_dict(sql)
+
+def get_validators_without_indexes() -> list:
+    """
+    Gets the validators which do not have a validator index in the database
+
+    Returns:
+    --------
+    list
+        A list of the public keys of the validators without a validator index
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT public_key
+    FROM validators
+    WHERE val_index IS NULL
+    """)
+    
+    result = cur.fetchall()
+    results = []
+
+    if len(result) > 0:
+        for row in result:
+            results.append(row[0])
+
+    con.close()
+    return results
+
+def create_sync_committee_table():
+    """
+    Creates the sync committee table in the database
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    # create the table
+    cur.execute("""
+    CREATE TABLE slot_sync_committee (
+        slot_number INTEGER NOT NULL,
+        validator_id INTEGER NOT NULL,
+        participated INTEGER NOT NULL,
+        UNIQUE(slot_number, validator_id),
+        FOREIGN KEY(validator_id) REFERENCES validators(id)
+    )
+    """)
+
+    con.commit()
+    con.close()
+
+def sync_committee_table_exists() -> bool:
+    """
+    Checks if the sync committee table exists or not
+
+    Returns:
+    --------
+    bool
+        True if table exist, False otherwise
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    # see if tables exist
+    cur.execute("""
+    SELECT count(name)
+    FROM sqlite_master
+    WHERE type = 'table'
+    AND name = 'slot_sync_committee'
+    """)
+
+    if cur.fetchone()[0] == 1:
+        con.close()
+        return True
+    
+    con.close()
+    return False
+
+def insert_sync_committee_performance(slot: int, validator_performance: dict):
+    """
+    Inserts the performance of the validators in the sync committee
+
+    Parameters:
+    -----------
+    slot : int
+        The slot for which the performance is
+    validator_performance : dict
+        A dict where the key is the validator index, and the value is whether it participated in the corresponding slot or not
+    """
+    # check that table exists before inserting
+    if not sync_committee_table_exists():
+        create_sync_committee_table()
+
+    # check that validator indexes column exists
+    if not validator_index_exists():
+        raise Exception("Cannot insert sync committee performance if the validators' table does not have validator indexes. (insert_sync_committee_performance())")
+
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    # create a dict to store validator indices and their corresponding id in the database
+    val_index_id_mapping = {}
+
+    # first get the validators' ids using their indices
+    for val_index in validator_performance:
+        cur.execute('SELECT id FROM validators WHERE val_index = ?', (val_index,))
+        result = cur.fetchall()
+        if len(result) > 0:
+            val_index_id_mapping[val_index] = result[0][0]
+        else:
+            raise Exception("Could not find validator with index "+str(val_index)+" in database. (insert_sync_committee_performance())")
+
+
+    # insert for each validator
+    for val_index, participated in validator_performance.items():
+        cur.execute("""
+        INSERT OR IGNORE INTO slot_sync_committee(slot_number, validator_id, participated)
+        VALUES(?, ?, ?)
+        """, (slot, val_index_id_mapping[val_index], participated))
+
+    con.commit()
+    con.close()
+
+def exists_sync_committee_performance_between_slots(start_slot: int, end_slot: int) -> bool:
+    """
+    Checks if we have validators that participated in the sync committee between the given slots
+
+    Parameters:
+    -----------
+    start_slot : int
+        The starting slot at which to check (included)
+    end_slot : int
+        The end slot at which to check (included)
+
+    Returns:
+    --------
+    bool
+        True if there are validators that participated during the given range, False otherwise
+    """
+    con = sl.connect(database_name)
+    cur = con.cursor()
+
+    # see if we have data for the slots given
+    cur.execute("""
+    SELECT COUNT(*)
+    FROM slot_sync_committee
+    WHERE slot_number >= ?
+    AND slot_number <= ?
+    """, (start_slot, end_slot,))
+
+    if cur.fetchone()[0] > 0:
+        con.close()
+        return True
+
+    con.close()
+    return False
+
+def get_sync_committee_performance_between_slots(start_slot: int, end_slot: int):
+    """
+    Gets the performance of the validators in the sync committee between the slots given
+
+    Parameters:
+    -----------
+    start_slot : int
+        The starting slot at which to get (included)
+    end_slot : int
+        The end slot at which to get (included)
+
+    Returns:
+    --------
+    dict
+        A dict where the key is the public key of the validator, and the value is the number of slots it participated in in the given range
+    dict
+        A dict where the key is the public key of the validator, and the value is the number of slots it did not participate in in the given range
+    """
+    # check that end slot is greater than start slot
+    if start_slot > end_slot:
+        raise Exception("End slot must be greater than start slot (get_sync_committee_performance_between_slots()).")
+
+    # check that sync committee table exists first
+    if not sync_committee_table_exists():
+        create_sync_committee_table()
+        
+        # if it did not exist, then return
+        return {}, {}
+
+    # check if we have validators that participated to begin with
+    if not exists_sync_committee_performance_between_slots(start_slot, end_slot):
+        return {}, {}
+
+    # get the participated count per each validator
+    sql = """
+    SELECT v.public_key, COUNT(*)
+    FROM slot_sync_committee s
+    JOIN validators v
+        ON s.validator_id = v.id
+    WHERE s.participated = 1
+        AND s.slot_number >= """+str(start_slot)+"""
+        AND s.slot_number <= """+str(end_slot)+"""
+    GROUP BY s.validator_id
+    """
+    participated = execute_query_dict(sql)
+
+    # get the missed count per each validator
+    sql = """
+    SELECT v.public_key, COUNT(*)
+    FROM slot_sync_committee s
+    JOIN validators v
+        ON s.validator_id = v.id
+    WHERE s.participated = 0
+        AND s.slot_number >= """+str(start_slot)+"""
+        AND s.slot_number <= """+str(end_slot)+"""
+    GROUP BY s.validator_id
+    """
+    missed = execute_query_dict(sql)
+
+    return participated, missed

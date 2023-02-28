@@ -64,6 +64,7 @@
   "gnetId": null,
   "graphTooltip": 0,
   "id": null,
+  "iteration": 1677508781243,
   "links": [],
   "panels": [
     {
@@ -1084,6 +1085,172 @@
       ],
       "title": "Average MEV Reward",
       "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "datasource": null,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "id": 38,
+      "panels": [],
+      "title": "Sync Committee",
+      "type": "row"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS_SECONDARY MT}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "dark-red",
+                "value": 25
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "#EAB839",
+                "value": 75
+              },
+              {
+                "color": "green",
+                "value": 90
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "id": 40,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "text": {},
+        "textMode": "auto"
+      },
+      "pluginVersion": "8.1.3",
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "(ValidatorSyncParticipated{epoch=\"$SyncCommitteeEpoch\"} / (ValidatorSyncParticipated{epoch=\"$SyncCommitteeEpoch\"} + ValidatorSyncMissed{epoch=\"$SyncCommitteeEpoch\"})) * 100",
+          "interval": "",
+          "legendFormat": "{{public_key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Sync Committee Participation %",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS_SECONDARY MT}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "id": 42,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "ValidatorSyncMissed{epoch=\"$SyncCommitteeEpoch\"}",
+          "interval": "",
+          "legendFormat": "{{public_key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Sync Committee Missed",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",
@@ -1091,15 +1258,39 @@
   "style": "dark",
   "tags": [],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": null,
+        "current": {},
+        "datasource": "${DS_PROMETHEUS_SECONDARY MT}",
+        "definition": "label_values(CurrentSyncCommitteeEpoch, epoch)",
+        "description": null,
+        "error": null,
+        "hide": 0,
+        "includeAll": false,
+        "label": "Sync Committee Epoch",
+        "multi": false,
+        "name": "SyncCommitteeEpoch",
+        "options": [],
+        "query": {
+          "query": "label_values(CurrentSyncCommitteeEpoch, epoch)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
   },
   "time": {
-    "from": "now-3h",
+    "from": "now-6h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
   "title": "ETH Blocks Monitor",
   "uid": "nhV_x8IVk",
-  "version": 41
+  "version": 52
 }

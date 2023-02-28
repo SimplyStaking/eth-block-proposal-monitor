@@ -3,10 +3,12 @@
     "eth2_rpc": "",
     "reward_metrics": true,
     "eth1_rpc": "",
-    "parallel_requests": true,
+    "parallel_requests_eth1": true,
+    "parallel_requests_eth2": true,
     "keys_file": "pubkeys.txt",
     "continue_from_last_slot": true,
     "last_slot": 0,
     "pruning": false,
-    "keep_last_slots": 100
+    "keep_last_slots": 100,
+    "sync_committee_participation": true
 }
