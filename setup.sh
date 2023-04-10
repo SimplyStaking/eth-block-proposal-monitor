@@ -20,7 +20,7 @@ Wants           = network-online.target
 [Service]
 User              = monitoring
 WorkingDirectory  = /home/monitoring/eth-block-proposal-monitor/src/
-ExecStart         = python3 -u /home/monitoring/eth-block-proposal-monitor/src/main.py
+ExecStart         = python3 -u /home/monitoring/eth-block-proposal-monitor/src/main.py -c "../config/config.json"
 Restart           = always
 RestartSec        = 5s
 

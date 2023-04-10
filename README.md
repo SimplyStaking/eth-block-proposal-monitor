@@ -9,16 +9,32 @@ ETH2 Block Proposal Monitor is a tool for Ethereum validators to monitor block p
 - List of validators' public keys to monitor.
 - Optional: An ETH1 RPC node for manual reward calculation.
 
-### Setup
+### Setup (Docker)
+1. Make sure you have Docker installed on your system
+2. Pull the docker image from the [repository](https://hub.docker.com/r/simplystaking/eth-block-proposal-monitor/tags): `docker pull simplystaking/eth-block-proposal-monitor`
+3. Run the image. The database is stored in `/usr/src/eth-block-monitor/data` in the container, thus we always suggest creating a corresponding volume on the host machine to this directory, to ensure no data loss on the deletion of the container, or when updating.
+```bash
+# example 1: the database will be stored in /root/data on the host machine, and the pubkeys.txt file is in the same directory
+docker run -d --name eth-block-monitor --log-driver=journald --restart always -v /root/data:/usr/src/eth-block-monitor/data -p 0.0.0.0:7999:7999 eth-block-monitor --port 7999 --pubkeys_file "/usr/src/eth-block-monitor/data/pubkeys.txt" --eth1_rpc "<EL-RPC-URL>" --eth2_rpc "<CL-RPC-URL>" --eth1_parallel --eth2_parallel --rewards --sync_committee
+
+# example 2: instead of passing command-line options, the options are in config.json. place config.json and pubkeys.txt in /root/data
+docker run -d --name eth-block-monitor --log-driver=journald --restart always -v /root/data:/usr/src/eth-block-monitor/data -p 0.0.0.0:7999:7999 eth-block-monitor -c "/usr/src/eth-block-monitor/data/config.json" --pubkeys_file "/usr/src/eth-block-monitor/data/pubkeys.txt"
+
+# example 3: options are in config.json, but you will be passing the public keys as a command-line option. place config.json /root/data
+docker run -d --name eth-block-monitor --log-driver=journald --restart always -v /root/data:/usr/src/eth-block-monitor/data -p 0.0.0.0:7999:7999 eth-block-monitor -c "/usr/src/eth-block-monitor/data/config.json" --pubkeys "0x001,0x002,0x003,0x004"
+```
+
+### Setup (Manual)
 1. Install Python 3.8+ (we are using v3.8.10).
 2. Install the required packages by running: `pip3 install -r requirements.txt` or `pip install -r requirements.txt`.
-3. In `config.json`, edit the value of `"eth2_rpc"` to the endpoint of your beacon chain RPC node.
-4. In `config.json`, edit the value of `"reward_metrics"` to true or false. If set to true, ensure to also populate the value of `"eth1_rpc"` to the endpoint of your ETH1 RPC node. Additionally, the value of `"parallel_requests_eth1"` may be changed, which significantly reduces the number of requests done to the ETH1 RPC node per second.
-5. In `config.json`, edit the value of `"sync_committee_participation"` to true or false. If set to true, you can additionally edit the value of `"parallel_requests_eth2"`, which significantly reduces the number of requests done to the Beacon Chain node when first getting the Validator indexes.
-5. Optional: In `config.json`, edit the value of `"port"` to your preferred value. This value determines on which port the Prometheus metrics will be outputted on.
-6. Optional: In `config.json`, the value of `"continue_from_last_slot"` can be edited to start from a later/earlier slot. By default, the first time the script is ran, it will only gather the last 100 slots. After enabling `"continue_from_last_slot"`, also edit the value of `"last_slot"` to the slot value to start gathering data from.
-7. Optional: In `config.json`, you can enable `"pruning"` to delete old slot data. You can choose the number of last slots to keep by editing the `"keep_last_slots"` value.
-8. Populate `pubkeys.txt` with the public keys of the validators you'd like to monitor. This is a comma-separated list.
+3. In `config.json`, or through command-line options: 
+    1. Edit the value of `"eth2_rpc"` to the endpoint of your beacon chain RPC node.
+    2. Optional: Edit the value of `"reward_metrics"` to true or false. If set to true, ensure to also populate the value of `"eth1_rpc"` to the endpoint of your ETH1 RPC node. Additionally, the value of `"parallel_requests_eth1"` may be changed, which significantly reduces the number of requests done to the ETH1 RPC node per second.
+    3. Optional: In `config.json`, edit the value of `"sync_committee_participation"` to true or false. If set to true, you can additionally edit the value of `"parallel_requests_eth2"`, which significantly reduces the number of requests done to the Beacon Chain node when first getting the Validator indexes.
+    4. Optional: In `config.json`, edit the value of `"port"` to your preferred value. This value determines on which port the Prometheus metrics will be outputted on.
+    5. Optional: In `config.json`, the value of `"continue_from_last_slot"` can be edited to start from a later/earlier slot. By default, the first time the script is ran, it will only gather the last 100 slots. After enabling `"continue_from_last_slot"`, also edit the value of `"last_slot"` to the slot value to start gathering data from.
+    6. Optional: In `config.json`, you can enable `"pruning"` to delete old slot data. You can choose the number of last slots to keep by editing the `"keep_last_slots"` value.
+4. Populate `pubkeys.txt` with the public keys of the validators you'd like to monitor. This is a comma-separated list. You can also provide the public keys through the command-line option `--pubkeys`. If using a file, unless a different path is provided with the `--pubkeys_file` option, the script will look for the file in `/data/`.
 
 ### Setup (Linux)
 If you're on Linux, you can follow these commands to create a user and run the script as that user:
@@ -48,7 +64,8 @@ chmod +x /home/monitoring/eth-block-proposal-monitor/setup.sh
 ```
 
 ### Config File
-The config file contains the following options:
+For a complete and up-to-date list of the options that can be provided through command-line or using the config file, run the script with `-h` or `--help`.
+<!-- The config file contains the following options:
 - `"port"`: The port on which the Prometheus metrics will be published.
 - `"eth2_rpc"`: The endpoint of the beacon chain node.
 - `"reward_metrics"`: Whether to keep track and publish reward metrics or not.
@@ -60,7 +77,7 @@ The config file contains the following options:
 - `"last_slot"`: The slot to continue from. It is ignored if `continue_from_last_slot` is set to true.
 - `"pruning"`: Whether to delete slot data in the database or not. If enabled, two new tables will be created in the database and only the last `keep_last_slots` will be kept in the slots table. The two new tables will contain the information needed to keep the metrics accurate.
 - `"keep_last_slots"`: The number of slots to keep in the slots table in the database. Regarded only if pruning is enabled.
-- `"sync_committee_participation"`: Whether to keep track of validators' sync committee participation (and publish the corresponding metrics) or not.
+- `"sync_committee_participation"`: Whether to keep track of validators' sync committee participation (and publish the corresponding metrics) or not. -->
 
 ### Usage
 After running the `main.py` script, Prometheus metrics are outputted on localhost on your chosen port. The script queries relays that are included in `relay_config.json` every 20 seconds, and stores information about each slot. After each iteration, the data is saved (to `slot_data.db` - this is an sqlite3 database) and the metrics are published.
@@ -84,3 +101,5 @@ The tool contains the following list of Prometheus metrics:
 12. `ValidatorSyncParticipated{public_key, epoch} -> int`: The number of slots the validator participated in, in the sync committee starting at the epoch indicated.
 13. `ValidatorSyncMissed{public_key, epoch} -> int`: The number of slots the validator did not participate in, in the sync committee starting at the epoch indicated.
 14. `CurrentSyncCommitteeEpoch{epoch} -> int`: If metric value is 1, it is the starting epoch of the current sync committee, if it is 0, then it is the starting epoch of the previous sync committee. This metric is mostly used for the Grafana dashboard.
+15. `UpcomingBlockProposal{public_key} -> int`: The slot number at which the validator will propose a block.
+16. `UpcomingSyncCommitteeParticipations{public_key} -> int`: The epoch at which the validator will start participating in the sync committee.

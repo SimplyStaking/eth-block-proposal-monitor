@@ -4,9 +4,16 @@ from os.path import dirname
 
 database_name = dirname(__file__)+'/../data/slot_data.db'
 
-def initialise_db():
+def initialise_db(keys: list, relay_config: dict):
     """
     Initialises the database by calling several functions
+
+    Parameters:
+    -----------
+    keys : list
+        A list of the public keys that the script will be monitoring
+    relay_config : dict
+        A dict where the key is the name of the relay and the value is the endpoint
 
     Returns:
     --------
@@ -14,21 +21,28 @@ def initialise_db():
         The data object used by the main function that has the slots and the various metrics
     """
     create_db()
-    insert_validators()
-    insert_relayers()
+    insert_validators(keys)
+    insert_relayers(relay_config)
     return populate_data_obj()
 
-def update_db():
+def update_db(keys: list, relay_config: dict):
     """
     Inserts any missing relayers and validators in the database without re-creating it
+
+    Parameters:
+    -----------
+    keys : list
+        A list of the public keys that the script will be monitoring
+    relay_config : dict
+        A dict where the key is the name of the relay and the value is the endpoint
 
     Returns:
     --------
     obj
         The data object used by the main function that has the slots and the various metrics
     """
-    insert_validators()
-    insert_relayers()
+    insert_validators(keys)
+    insert_relayers(relay_config)
     return populate_data_obj()
 
 def create_db():
@@ -96,25 +110,21 @@ def validator_exists(pub_key: str) -> bool:
     con.close()
     return False
 
-def insert_validators():
+def insert_validators(keys: list):
     """
     Reads the file containing the public keys of the validators and inserts them into the database
+
+    Parameters:
+    -----------
+    keys : list
+        A list of the public keys that will be inserted in the database
     """
     con = sl.connect(database_name)
-
-    # open the validators file
-    f = open(dirname(__file__)+'/../config/config.json')
-    config = json.load(f)
-
-    with open(dirname(__file__)+'/../config/'+config["keys_file"], 'r') as fp:
-        txt = fp.read()
-        keys = txt.split(",")
 
     # filling the validators table
     cur = con.cursor()
 
     for key in keys:
-        key = key.replace('\n','').replace('\r','')
         if not validator_exists(key):
             cur.execute('INSERT OR IGNORE INTO validators(public_key) VALUES(?)', (key,))
 
@@ -146,15 +156,16 @@ def relayer_exists(endpoint: str) -> bool:
     con.close()
     return False
 
-def insert_relayers():
+def insert_relayers(relay_config: dict):
     """
     Reads the file containing the relayers and inserts them into the database
+
+    Parameters:
+    -----------
+    relay_config : dict
+        A dict where the key is the name of the relay and the value is the endpoint
     """
     con = sl.connect(database_name)
-
-    # open relayers file
-    f = open(dirname(__file__)+'/../config/relay_config.json')
-    relay_config = json.load(f)
 
     # filling the relayers table
     cur = con.cursor()

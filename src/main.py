@@ -1,13 +1,10 @@
-import requests
-import json
-import time
-import codecs
+import requests, json, time, codecs, re, sys, getopt
 from helper_funcs import *
 from db_ops import *
 from prometheus_client.core import CollectorRegistry, GaugeMetricFamily, REGISTRY, CounterMetricFamily, Gauge
 from prometheus_client import start_http_server
-from os.path import isfile, dirname
-import re
+from os.path import isfile, dirname, exists
+from os import getcwd
 
 def increment_metric_state(gauge_name, key):
     """
@@ -181,7 +178,7 @@ def update_reward_metrics(relayer, reward):
             avg_reward_gauge.labels(relayer).set(avg)
             update_relayer_metric_state("AvgRelayerRewards", relayer, avg, False)
 
-def get_epoch_from_slot(slot):
+def get_epoch_from_slot(slot) -> int:
     """
     Calculates the epoch number from the slot number
 
@@ -196,7 +193,7 @@ def get_epoch_from_slot(slot):
         The epoch that the slot is in
     """
     # there are 32 slots in each epoch
-    return slot/32
+    return slot // 32
 
 def get_slot_proposer(slot):
     """
@@ -214,13 +211,13 @@ def get_slot_proposer(slot):
     """
     global config, retries
 
-    epoch = int(get_epoch_from_slot(slot))
+    epoch = get_epoch_from_slot(slot)
 
     s = requests.Session()
     s.mount('http://', HTTPAdapter(max_retries=retries))
 
     # get duties for epoch (block proposers)
-    duties = s.get(config["eth2_rpc"]+"/eth/v1/validator/duties/proposer/"+str(epoch), timeout=10).json()
+    duties = s.get(eth2_rpc+"/eth/v1/validator/duties/proposer/"+str(epoch), timeout=45).json()
     for duty in duties["data"]:
         if duty["slot"] == str(slot):
             # return the public key of the validator for that slot
@@ -244,14 +241,14 @@ def check_duties(slot):
     """
     global config
 
-    epoch = int(get_epoch_from_slot(slot))
+    epoch = get_epoch_from_slot(slot)
 
     s = requests.Session()
     temp_retries = Retry(total=10, backoff_factor=0.00005, status_forcelist=[503, 504], allowed_methods=frozenset(['GET', 'POST']))
     s.mount('http://', HTTPAdapter(max_retries=temp_retries))
 
     # try to get duties for given epoch
-    duties = s.get(config["eth2_rpc"]+"/eth/v1/validator/duties/proposer/"+str(epoch), timeout=45).json()
+    duties = s.get(eth2_rpc+"/eth/v1/validator/duties/proposer/"+str(epoch), timeout=45).json()
 
     if 'data' in duties:
         # if we have data, then we can proceed
@@ -285,7 +282,7 @@ def get_current_slot() -> int:
 
     # try to return the slot number as an integer
     try:
-        data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/headers", timeout=60).json()
+        data = s.get(eth2_rpc+"/eth/v1/beacon/headers", timeout=60).json()
         return int(data['data'][0]['header']['message']['slot'])
     except Exception as e:
         raise Exception("Failed to get current slot (get_current_slot()): "+e)
@@ -345,14 +342,14 @@ def get_validator_indexes_parallel(public_keys: list) -> dict:
                     s.mount('http://', HTTPAdapter(max_retries=retries))
 
                     # try to get the validator index
-                    data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/"+str(curr_slot)+"/validators/"+key, timeout=30).json()
+                    data = s.get(eth2_rpc+"/eth/v1/beacon/states/"+str(curr_slot)+"/validators/"+key, timeout=30).json()
                     data = data['data']['index']
 
                     # if we got it, append it as a dict where the key is the public key, and the value is the index
                     self.results.append({key: data})
                     self.queue.task_done()
                 except Exception as e:
-                    print("ETH2 request failed - get_validator_indexes_parallel(): "+e)
+                    print("WARN: ETH2 request failed - get_validator_indexes_parallel(): "+e)
                     self.results.append({key: None})
                     self.queue.task_done()
     
@@ -420,7 +417,7 @@ def get_validator_index(slot: int, key: str) -> int:
     
     # attempt the request
     try:
-        data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/"+str(slot)+"/validators/"+key, timeout=60).json()
+        data = s.get(eth2_rpc+"/eth/v1/beacon/states/"+str(slot)+"/validators/"+key, timeout=60).json()
         return data['data']['index']
     except Exception as e:
         raise Exception("Failed to get validator index (get_validator_index()): "+e)
@@ -487,9 +484,13 @@ def check_sync_committee(validator_indexes: list, curr_slot: int = 0):
         try:
             val_sync_participated_gauge.remove(validators_index_key_mappings[val_index], curr_sync_start_epoch-256)
             val_sync_missed_gauge.remove(validators_index_key_mappings[val_index], curr_sync_start_epoch-256)
-            current_sync_committee_epoch_gauge.remove(curr_sync_start_epoch-256)
         except:
-            print("Failed to remove old committee metrics (check_sync_committee()).")
+            print("WARN: Failed to remove old committee metrics (check_sync_committee()).")
+
+    try:
+        current_sync_committee_epoch_gauge.remove(curr_sync_start_epoch-256)
+    except:
+        pass
 
     # check if we have a slot number, otherwise get it
     if curr_slot == 0:
@@ -512,6 +513,10 @@ def check_sync_committee(validator_indexes: list, curr_slot: int = 0):
         prev_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch-256)
     curr_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch)
     next_sync_committee = get_validator_committee_index(validator_indexes, next_sync_start_epoch)
+
+    # update upcoming sync committee metrics
+    update_upcoming_sync_committee_participations(next_sync_start_epoch)
+    update_upcoming_sync_committee_part_metrics(next_sync_start_epoch)
 
     # initialise the metrics for the current committee to 0
     for val_index in curr_sync_committee:
@@ -726,7 +731,7 @@ def get_validator_committee_index(validator_indexes: list, epoch: int) -> dict:
     s.mount('http://', HTTPAdapter(max_retries=retries))
 
     try:
-        data = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/finalized/sync_committees?epoch="+str(epoch), timeout=60).json()
+        data = s.get(eth2_rpc+"/eth/v1/beacon/states/finalized/sync_committees?epoch="+str(epoch), timeout=60).json()
         
         # convert sync committee validator indexes to int so we can compare
         sync_committee = list(map(int, data['data']['validators']))
@@ -766,7 +771,7 @@ def get_slot(slot: int) -> dict:
     s = requests.Session()
     s.mount('http://', HTTPAdapter(max_retries=retries))
     try:
-        data = s.get(config["eth2_rpc"]+"/eth/v2/beacon/blocks/"+str(slot)).json()
+        data = s.get(eth2_rpc+"/eth/v2/beacon/blocks/"+str(slot)).json()
         if 'code' in data:
             if data['code'] == 500:
                 raise Exception("Error from node while getting slot "+str(slot)+"\n"+data['message'])
@@ -805,6 +810,226 @@ def get_slot_sync_committee_bits(slot: int = 0, slot_data: dict = {}) -> str:
         # block is missed - return 0x0
         return "0x0"
 
+def update_upcoming_block_proposals(curr_slot: int):
+    """
+    Updates the global variable keeping track of upcoming block proposals
+
+    Parameters:
+    -----------
+    curr_slot : int
+        The current / last slot number
+    """
+    global upcoming_proposals
+
+    # get the upcoming block proposals
+    block_proposals = get_upcoming_block_proposals(get_epoch_from_slot(curr_slot))
+    block_proposals = [x for x in block_proposals if x['slot'] > curr_slot]
+
+    # add block proposals which are not already in the list
+    for proposal in block_proposals:
+        if proposal not in upcoming_proposals:
+            upcoming_proposals.append(proposal)
+
+def get_upcoming_block_proposals(epoch: int) -> list:
+    """
+    Gets block proposals where the proposer is one of the validators it is monitoring, up to 2 epochs ahead
+
+    Parameters:
+    -----------
+    epoch : int
+        The epoch to start checking at. We can see at most 2 epochs ahead of the current
+
+    Returns:
+    --------
+    list
+        A list of dicts, where the dicts contain the public key of the proposer and the slot at which it is proposing
+    """
+    global config, retries, keys
+
+    s = requests.Session()
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+
+    results = []
+
+    # try to get duties for given epoch
+    duties_1 = s.get(eth2_rpc+"/eth/v1/validator/duties/proposer/"+str(epoch), timeout=45).json()
+
+    try:
+        # iterate over duties to see if we have any matching keys
+        for duty in duties_1['data']:
+            # if we do have a matching key, add it to the results
+            if duty['pubkey'] in keys:
+                results.append({
+                    "pubkey": duty['pubkey'],
+                    "slot": int(duty['slot'])
+                })
+
+        try:
+            # try to get duties for next epoch
+            duties_2 = s.get(eth2_rpc+"/eth/v1/validator/duties/proposer/"+str(epoch+1), timeout=45).json()
+            
+            for duty in duties_2['data']:
+                if duty['pubkey'] in keys:
+                    results.append({
+                        "pubkey": duty['pubkey'],
+                        "slot": int(duty['slot'])
+                    })
+            
+            try:
+                # & try for epoch after
+                duties_3 = s.get(eth2_rpc+"/eth/v1/validator/duties/proposer/"+str(epoch+2), timeout=45).json()
+
+                for duty in duties_3['data']:
+                    if duty['pubkey'] in keys:
+                        results.append({
+                            "pubkey": duty['pubkey'],
+                            "slot": int(duty['slot'])
+                        })
+            except:
+                return results
+        except:
+            return results
+    except:
+        return results
+    
+    return results
+
+def update_upcoming_sync_committee_participations(epoch: int):
+    """
+    Updates the global variable keeping track of upcoming sync committee participations
+
+    Parameters:
+    -----------
+    epoch : int
+        The first (or any) epoch of the next sync committee
+    """
+    global upcoming_sync_committee
+
+    # get the upcoming participations
+    participants = get_upcoming_sync_committee_participations(epoch)
+
+    # add block proposals which are not already in the list
+    for participant in participants:
+        if participant not in upcoming_sync_committee:
+            upcoming_sync_committee.append(participant)
+
+def get_upcoming_sync_committee_participations(epoch: int) -> list:
+    global config, retries, validators_index_key_mappings
+
+    s = requests.Session()
+    s.mount('http://', HTTPAdapter(max_retries=retries))
+
+    results = []
+
+    # try to get sync committee for epoch provided
+    data = s.get(eth2_rpc+"/eth/v1/beacon/states/finalized/sync_committees?epoch="+str(epoch), timeout=60).json()
+
+    try:
+        # convert sync committee validator indexes to int so we can compare
+        sync_committee = list(map(int, data['data']['validators']))
+        
+        for index in sync_committee:
+            if index in list(validators_index_key_mappings.keys()):
+                results.append({
+                        "pubkey": validators_index_key_mappings[index],
+                        "epoch": epoch
+                    })
+        
+        return results
+    except:
+        return results
+
+def update_block_prop_metrics(last_slot: int):
+    """
+    Creates the relevant metrics related to upcoming block proposals
+
+    Parameters:
+    -----------
+    last_slot : int
+        The current / last slot number
+    """
+    global upcoming_block_prop_gauge, upcoming_proposals
+
+    # remove metrics where the slot number is smaller than the current
+    upcoming_proposals = [x for x in upcoming_proposals if check_proposal(x, last_slot)]
+
+    # create metrics for upcoming block proposals
+    for proposal in upcoming_proposals:
+        upcoming_block_prop_gauge.labels(proposal['pubkey']).set(proposal['slot'])
+
+def check_proposal(proposal: dict, last_slot: int) -> bool:
+    """
+    Checks if a block proposal is upcoming or in the past, and removes the metric accordingly
+
+    Parameters:
+    -----------
+    proposal : dict
+        A dict containing the public key of the proposer, and the slot at which it is proposing
+
+    Returns:
+    --------
+    bool
+        Whether the proposal is in the future or not
+    """
+    global upcoming_block_prop_gauge
+    
+    # if proposal is older than the current slot, then we need to remove it
+    if proposal['slot'] <= last_slot:
+        try:
+            # remove its metric and indicate it should be removed from the list as well
+            upcoming_block_prop_gauge.remove(proposal['pubkey'])
+        except:
+            pass
+        return False
+    
+    # if proposal is in the future, we keep it
+    return True
+
+def update_upcoming_sync_committee_part_metrics(epoch: int):
+    """
+    Creates the relevant metrics related to upcoming sync committee participation
+
+    Parameters:
+    -----------
+    epoch : int
+        
+    """
+    global upcoming_sync_comm_part_gauge, upcoming_sync_committee
+
+    # remove metrics where the epoch number is smaller than the current
+    upcoming_sync_committee = [x for x in upcoming_sync_committee if check_participant(x, epoch)]
+
+    # create metrics for upcoming sync committee participation
+    for participant in upcoming_sync_committee:
+        upcoming_sync_comm_part_gauge.labels(participant['pubkey']).set(participant['epoch'])
+
+def check_participant(participant: dict, epoch: int) -> bool:
+    """
+    Checks if a sync participant is in the future or not, and removes the corresponding metric accordingly
+
+    Parameters:
+    -----------
+    participant : dict
+        A dict containing the public key of the participant and the starting epoch of its participation
+
+    Returns:
+    --------
+    bool
+        Whether the participation is in the future (upcoming) or not
+    """
+    global upcoming_sync_comm_part_gauge
+    
+    # if proposal is older than the current slot, then we need to remove it
+    if participant['epoch'] < epoch:
+        try:
+            # remove its metric and indicate it should be removed from the list as well
+            upcoming_sync_comm_part_gauge.remove(participant['pubkey'])
+        except:
+            pass
+        return False
+    
+    # if proposal is in the future, we keep it
+    return True
 
 def check_if_empty(slot):
     """
@@ -1024,7 +1249,7 @@ def reward_extraction(slot=None, block=None) -> float:
     global config, parallel_requests
 
     if slot is None and block is None:
-        print('At least one argument must be passed.')
+        print('ERR: At least one argument must be passed.')
     
     # if block was not passed, get it using the rpc
     if slot is not None and block is None:
@@ -1032,9 +1257,9 @@ def reward_extraction(slot=None, block=None) -> float:
 
     # calculate reward manually
     if parallel_requests:
-        value = calculate_rewards_parallel(int(block['data']['message']['body']['execution_payload']['block_number']), config["eth1_rpc"])
+        value = calculate_rewards_parallel(int(block['data']['message']['body']['execution_payload']['block_number']), eth1_rpc)
     else:
-        value = calculate_rewards(int(block['data']['message']['body']['execution_payload']['block_number']), config["eth1_rpc"])
+        value = calculate_rewards(int(block['data']['message']['body']['execution_payload']['block_number']), eth1_rpc)
 
     return value
 
@@ -1071,15 +1296,14 @@ def get_non_relayed_slot(slot):
         if(extra_data != '0x'):
             # if not empty, decode
             extra_data_str = bytes.fromhex(extra_data[2:]).decode('utf-8', 'ignore')
-            print(extra_data_str)
 
             # common relayer extra_data
             if 'bloxroute' in extra_data_str.lower():
                 relay_value = 'BloXroute Max Profit'
-                print("Matched "+extra_data_str+" with relay BloXroute Max Profit")
+                print("INF: Matched "+extra_data_str+" with relay BloXroute Max Profit")
             elif 'illuminate dmocratize dstribute' in extra_data_str.lower() or 'illuminate democratize distribute' in extra_data_str.lower():
                 relay_value = 'Flashbots'
-                print("Matched "+extra_data_str+" with relay Flashbots")
+                print("INF: Matched "+extra_data_str+" with relay Flashbots")
             else:
                 # go through each relayer name
                 for relay, url in relay_config.items():
@@ -1087,14 +1311,14 @@ def get_non_relayed_slot(slot):
                     if relay.lower() in extra_data_str.lower() or url.lower() in extra_data_str.lower():
                         # if they are, assign that relayer value
                         relay_value = relay
-                        print("Matched "+extra_data_str+" with relay "+relay)
+                        print("INF: Matched "+extra_data_str+" with relay "+relay)
                         break
         
         # get the validator public key
         proposer_index = block["data"]["message"]["proposer_index"]
         s = requests.Session()
         s.mount('http://', HTTPAdapter(max_retries=retries))
-        validator = s.get(config["eth2_rpc"]+"/eth/v1/beacon/states/head/validators/"+str(proposer_index)).json()
+        validator = s.get(eth2_rpc+"/eth/v1/beacon/states/head/validators/"+str(proposer_index)).json()
         
         # if we're tracking sync committee participation, update metrics
         if sync_committee_metrics:
@@ -1198,7 +1422,7 @@ def get_all_payloads():
     Returns:
     -----------
     list
-        List of slots with the same structure as in get_payloads()
+        List of ordered slots with the same structure as in get_payloads()
     """
 
     global relay_config, slots_limit
@@ -1221,125 +1445,269 @@ def get_all_payloads():
     payloads = payloads[-slots_limit:]
 
     return payloads
-            
-# initialise data object to hold slots and metrics
-data_obj = {
-    "last_slot": 0,
-    "slots": [],
-    "latest_metrics": {
-        "RelayBlocksProposed": {},
-        "TotalRelayBlocksProposed": {},
-        "RelayTotalRewards": {},
-        "AvgRelayerRewards": {},
-        "UnknownRewardsBlocks": {},
-        "ValidatorBlocksProposed": {},
-        "MissedBlockProposals": {},
-        "EmptyBlockProposals": {},
-        "TotalValidatorRewards": {},
-        "AvgValidatorRewards": {},
-        "ValUnknownRewardBlocks": {}
+
+def get_all_payloads_parallel():
+    """
+    Performs parallel requests to relays to get their payloads
+
+    Returns:
+    -----------
+    list
+        List of ordered slots with the same structure as in get_payloads()
+    """
+    global relay_config, slots_limit, retries
+
+    class Worker(Thread):
+        """
+        A class used to represent a worker thread
+
+        Attributes:
+        -----------
+        queue : Queue
+            Queue of relay names and endpoints to query
+        results : list[list[dict]]
+            List of lists of payloads of the relays
+        
+        Methods:
+        --------
+        run
+            Performs a request to the relay to get the payloads
+        """
+        def __init__(self, ep_queue):
+            """
+            Parameters:
+            -----------
+            ep_queue : Queue
+                The queue where dicts containing the relay names and endpoints will be placed
+            """
+            Thread.__init__(self)
+            self.queue = ep_queue
+            self.results = []
+
+        def run(self):
+            """
+            Performs a request to the relay, and gets its payloads
+
+            Returns:
+            --------
+            list
+                The payloads of that relay
+            """
+            while True:
+                # get new relay to request
+                relay = self.queue.get()
+
+                if relay['endpoint'] == "":
+                    # an empty string is a signal to stop
+                    break
+                try:
+                    # start a new session - so we can attempt requests multiple times
+                    s = requests.Session()
+
+                    # specify details to retry
+                    s.mount('http://', HTTPAdapter(max_retries=retries))
+
+                    # try the request
+                    slots = s.get(relay['endpoint']+"/relay/v1/data/bidtraces/proposer_payload_delivered?limit="+str(slots_limit), timeout=10)
+                    slots.raise_for_status()
+
+                    # convert to json
+                    slots = slots.json()
+                    
+                    # convert strings to ints
+                    for slot in slots:
+                        for key in slot:
+                            if (key in ['slot', 'gas_limit', 'gas_used', 'value']):
+                                slot[key] = int(slot[key])
+                    
+                    # adding "relay" key
+                    for slot in slots:
+                        slot['relay'] = relay['name']
+
+                    # append to the list of results
+                    self.results.append(slots)
+
+                    # notify queue that the current task is done
+                    print('INF: Successfully got payloads from relay "'+relay['name']+'".')
+                    self.queue.task_done()
+                except requests.exceptions.RequestException:
+                    # if the request failed, we cannot do anything
+                    print('WARN: Failed to get payloads from relay "'+relay['name']+'".')
+                    self.results.append([])
+                    self.queue.task_done()
+
+    # create a worker per relay
+    num_workers = len(relay_config)
+    q = Queue()
+
+    # add each relay in the queue
+    for key, value in relay_config.items():
+        q.put({
+            'name': key,
+            'endpoint': value
+        })
+
+    # workers don't stop until they receive an empty string
+    for _ in range(num_workers * 2):
+        q.put({
+            'name': "",
+            'endpoint': ""
+        })
+
+    # create workers
+    workers = []
+
+    # start the workers
+    for _ in range(num_workers):
+        worker = Worker(q)
+        worker.start()
+        workers.append(worker)
+    
+    # wait for all the workers to be done
+    for worker in workers:
+        worker.join()
+
+    # get the results
+    results = []
+    for worker in workers:
+        for list in worker.results:
+            for payload in list:
+                results.append(payload)
+        
+    # sort by slot number
+    results = sorted(results, key=lambda d: d['slot'])
+
+    # keep only the last x slots
+    results = results[-slots_limit:]
+
+    return results
+
+def main(options: dict):
+    """
+    Performs all the functions in a loop and sleeps for 20s
+
+    Parameters:
+    -----------
+    options : dict
+        The CLI options (or from config.json) that configure the script
+    """
+    # defining global variables
+    global data_obj, data, keys, eth1_rpc, eth2_rpc, slots_limit, reward_metrics, sync_committee_metrics, parallel_requests, relay_config, keys, validators_index_key_mappings, prev_sync_committee, curr_sync_committee, next_sync_committee, curr_sync_start_epoch, next_sync_start_epoch, upcoming_proposals, upcoming_sync_committee, retries
+
+    # defining global variables for metrics
+    global relay_blocks_gauge, validator_totals_gauge, missed_gauge, empty_gauge, total_relay_blocks_gauge, total_rewards_gauge, avg_reward_gauge, unknown_reward_blocks,val_total_rewards_gauge, val_avg_reward_gauge, val_unknown_reward_blocks, val_sync_participated_gauge, val_sync_missed_gauge, current_sync_committee_epoch_gauge, upcoming_block_prop_gauge, upcoming_sync_comm_part_gauge
+
+    # initialise data object to hold slots and metrics
+    data_obj = {
+        "last_slot": 0,
+        "slots": [],
+        "latest_metrics": {
+            "RelayBlocksProposed": {},
+            "TotalRelayBlocksProposed": {},
+            "RelayTotalRewards": {},
+            "AvgRelayerRewards": {},
+            "UnknownRewardsBlocks": {},
+            "ValidatorBlocksProposed": {},
+            "MissedBlockProposals": {},
+            "EmptyBlockProposals": {},
+            "TotalValidatorRewards": {},
+            "AvgValidatorRewards": {},
+            "ValUnknownRewardBlocks": {}
+        }
     }
-}
 
-# variable to get last x slots from relayers
-slots_limit = 100
+    # variable to get last x slots from relayers
+    slots_limit = 100
 
-# open config
-f = open(dirname(__file__)+'/../config/config.json')
-config = json.load(f)
+    # declare execution and consensus layer endpoints
+    eth1_rpc = options['eth1_rpc']
+    eth2_rpc = options['eth2_rpc']
 
-# are we tracking rewards?
-reward_metrics = config["reward_metrics"]
+    # are we tracking rewards?
+    reward_metrics = options['rewards']
 
-# are we tracking sync committee participation?
-sync_committee_metrics = config["sync_committee_participation"]
+    # are we tracking sync committee participation?
+    sync_committee_metrics = options["sync_committee"]
 
-# should requests to the ETH1 RPC be parallel?
-parallel_requests = config["parallel_requests_eth1"]
+    if reward_metrics:
+        # should requests to the ETH1 RPC be parallel?
+        parallel_requests = options["eth1_parallel"]
 
-# check if we have a db
-if isfile(dirname(__file__)+'/../data/slot_data.db'):
-    data = update_db()
-else:
-    data = initialise_db()
+    # open config of relay names and endpoints
+    f = open(options['relay_config'])
+    relay_config = json.load(f)
 
-# check whether we are to continue from the last slot in the database or not
-if not config['continue_from_last_slot']:
-    data['last_slot'] = config['last_slot'] - 1
-
-# check if database is too old to continue from that point
-if data['last_slot'] != 0:
-    result = check_duties(data['last_slot'])
-    if result == 0:
-        pass
+    # check if we have a db
+    if isfile(getcwd()+'/../data/slot_data.db'):
+        data = update_db(keys, relay_config)
     else:
-        if result != -1:
-            raise Exception("Last slot in database is too old to proceed from. You can start from slot "+str(result+32)+" or higher.")
+        data = initialise_db(keys, relay_config)
+
+    # check whether we are to continue from the last slot in the database or not
+    if options['last_slot'] != 0:
+        data['last_slot'] = options['last_slot'] - 1
+
+    # check if database is too old to continue from that point
+    if data['last_slot'] != 0:
+        result = check_duties(data['last_slot'])
+        if result == 0:
+            pass
         else:
-            raise Exception("Last slot in database is too old to proceed from.")
-
-# open config of relay names and endpoints
-f = open(dirname(__file__)+'/../config/relay_config.json')
-relay_config = json.load(f)
-
-# load metrics
-latest_metrics = data["latest_metrics"]
-last_slot = data["last_slot"]
-
-# load the public keys
-with open(dirname(__file__)+'/../config/'+config["keys_file"], 'r') as fp:
-    txt = fp.read()
-    keys = txt.split(",")
-
-    # remove unnecessary duplicates
-    unique = []
-    for key in keys:
-        if key not in unique:
-            unique.append(key)
-    keys = unique
-    print('Total keys:', len(keys))
-
-if sync_committee_metrics:
-    # check if we have added the validator index column in the validators' table
-    if not validator_index_exists():
-        # if validator index table is not present, then we have to create and fill column
-        print("Fetching validator indexes, this process might take a while depending on your RPC client and whether parallel requests are enabled.")
-        if config["parallel_requests_eth2"]:
-            insert_validator_indexes(get_validator_indexes_parallel(keys))
-        else:
-            insert_validator_indexes(get_validator_indexes(keys))
-        print("Validator indexes gathered and stored in database.")
-    else:
-        # if we have the validator index column, check that we have the validator index for ALL validators in the db
-        vals_without_index = get_validators_without_indexes()
-
-        if len(vals_without_index) > 0:
-            # get the validator indexes for those without index
-            print("Fetching validator indexes for "+str(len(vals_without_index))+" validators. This process might take a while depending on your RPC client and whether parallel requests are enabled.")
-            if config["parallel_requests_eth2"]:
-                insert_validator_indexes(get_validator_indexes_parallel(vals_without_index))
+            if result != -1:
+                raise Exception("Last slot in database is too old to proceed from. You can start from slot "+str(result+32)+" or higher.")
             else:
-                insert_validator_indexes(get_validator_indexes(vals_without_index))
-            print("Validator indexes gathered and stored in database.")
+                raise Exception("Last slot in database is too old to proceed from.")
 
-    # store validator indexes - public key mappings
-    validators_index_key_mappings = get_validator_indexes_pub_key_mappings()
+    # load metrics
+    latest_metrics = data["latest_metrics"]
+    last_slot = data["last_slot"]
 
-    # keeping track of sync committees
-    prev_sync_committee = {}
-    curr_sync_committee = {}
-    next_sync_committee = {}
+    if sync_committee_metrics:
+        # check if we have added the validator index column in the validators' table
+        if not validator_index_exists():
+            # if validator index table is not present, then we have to create and fill column
+            print("INF: Fetching validator indexes, this process might take a while depending on your RPC client and whether parallel requests are enabled.")
+            if options["eth2_parallel"]:
+                insert_validator_indexes(get_validator_indexes_parallel(keys))
+            else:
+                insert_validator_indexes(get_validator_indexes(keys))
+            print("INF: Validator indexes gathered and stored in database.")
+        else:
+            # if we have the validator index column, check that we have the validator index for ALL validators in the db
+            vals_without_index = get_validators_without_indexes()
 
-    # also keep track of when the current committee starts and ends
-    curr_sync_start_epoch = 0
-    next_sync_start_epoch = 0
+            if len(vals_without_index) > 0:
+                # get the validator indexes for those without index
+                print("INF: Fetching validator indexes for "+str(len(vals_without_index))+" validators. This process might take a while depending on your RPC client and whether parallel requests are enabled.")
+                if options["eth2_parallel"]:
+                    insert_validator_indexes(get_validator_indexes_parallel(vals_without_index))
+                else:
+                    insert_validator_indexes(get_validator_indexes(vals_without_index))
+                print("INF: Validator indexes gathered and stored in database.")
 
-# for retrying requests
-retries = Retry(total=10, backoff_factor=0.005, status_forcelist=[500, 503, 504], allowed_methods=frozenset(['GET', 'POST']))
+        # store validator indexes - public key mappings
+        validators_index_key_mappings = get_validator_indexes_pub_key_mappings()
 
-if __name__ == '__main__':
+        # keeping track of sync committees
+        prev_sync_committee = {}
+        curr_sync_committee = {}
+        next_sync_committee = {}
+
+        # also keep track of when the current committee starts and ends
+        curr_sync_start_epoch = 0
+        next_sync_start_epoch = 0
+
+        # create a global variable for holding future sync committee participations
+        upcoming_sync_committee = []
+
+    # create a global variable for holding future block proposals
+    upcoming_proposals = []
+
+    # for retrying requests
+    retries = Retry(total=10, backoff_factor=0.005, status_forcelist=[500, 503, 504], allowed_methods=frozenset(['GET', 'POST']))
+
     # initialise http server & collector
-    start_http_server(config["port"])
+    start_http_server(options["port"])
     collector = CollectorRegistry()
 
     # initialise the different metrics
@@ -1364,6 +1732,11 @@ if __name__ == '__main__':
         val_sync_participated_gauge = Gauge("ValidatorSyncParticipated", 'Total number of participations in current sync committee by validator.', ["public_key", "epoch"], registry=collector)
         val_sync_missed_gauge = Gauge("ValidatorSyncMissed", 'Total number of missed participations in current sync committee by validator.', ["public_key", "epoch"], registry=collector)
         current_sync_committee_epoch_gauge = Gauge("CurrentSyncCommitteeEpoch", 'Label contains the epoch at which the committee sync started. Value is 1 if it is the current committee and 0 otherwise.', ["epoch"], registry=collector)
+        # initialise upcoming sync committee participations metrics if sync committee metrics are enabled
+        upcoming_sync_comm_part_gauge = Gauge("UpcomingSyncCommitteeParticipations", 'The epoch at which the validator will start participating in the sync committee for 256 epochs.', ["public_key"], registry=collector)
+
+    # initialise upcoming block proposals & sync committee participations metrics
+    upcoming_block_prop_gauge = Gauge("UpcomingBlockProposal", 'The slot number at which the validator is proposing a block.', ["public_key"], registry=collector)
 
     REGISTRY.register(collector)
 
@@ -1371,92 +1744,237 @@ if __name__ == '__main__':
     init_metrics(last_slot)
     load_metrics(latest_metrics)
 
-while True: 
-    # get all the slots from all the relays
-    slots = get_all_payloads()
+    while True: 
+        # get all the slots from all the relays
+        slots = get_all_payloads_parallel()
 
-    for slot in slots:
-        if slot["slot"] > data_obj["last_slot"]:
-            # first check that we have initialised sync committee variables
-            if sync_committee_metrics:
-                if curr_sync_start_epoch == 0:
-                    curr_slot = data_obj["last_slot"] + 1 if (data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1) else slot["slot"]
-                    check_sync_committee(list(validators_index_key_mappings.keys()), curr_slot)
+        for slot in slots:
+            if slot["slot"] > data_obj["last_slot"]:
+                # first check that we have initialised sync committee variables
+                if sync_committee_metrics:
+                    if curr_sync_start_epoch == 0:
+                        curr_slot = data_obj["last_slot"] + 1 if (data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1) else slot["slot"]
+                        check_sync_committee(list(validators_index_key_mappings.keys()), curr_slot)
 
-                    # see if we have any values in the database for the past committee
-                    participated, missed = get_sync_committee_performance_between_slots((curr_sync_start_epoch-256)*32, (curr_sync_start_epoch*32)-1)
+                        # see if we have any values in the database for the past committee
+                        participated, missed = get_sync_committee_performance_between_slots((curr_sync_start_epoch-256)*32, (curr_sync_start_epoch*32)-1)
 
-                    if participated != {}:
-                        set_sync_committee_metrics(participated, missed, curr_sync_start_epoch-256)
+                        if participated != {}:
+                            set_sync_committee_metrics(participated, missed, curr_sync_start_epoch-256)
 
-                    # see if we have any values in the database for the current committee
-                    participated, missed = get_sync_committee_performance_between_slots(curr_sync_start_epoch*32, (next_sync_start_epoch*32)-1)
+                        # see if we have any values in the database for the current committee
+                        participated, missed = get_sync_committee_performance_between_slots(curr_sync_start_epoch*32, (next_sync_start_epoch*32)-1)
 
-                    if participated != {}:
-                        set_sync_committee_metrics(participated, missed, curr_sync_start_epoch)
+                        if participated != {}:
+                            set_sync_committee_metrics(participated, missed, curr_sync_start_epoch)
 
-            # if we skipped slots - get data manually through rpc
-            if data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1:
-                # get the missing slots
-                missing_slot_count = slot["slot"] - data_obj["last_slot"]
-                for i in range(missing_slot_count - 1):
-                    missing_slot = data_obj["last_slot"]+i+1
-                    print("Missing slot", missing_slot)
+                # if we skipped slots - get data manually through rpc
+                if data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1:
+                    # get the missing slots
+                    missing_slot_count = slot["slot"] - data_obj["last_slot"]
+                    for i in range(missing_slot_count - 1):
+                        missing_slot = data_obj["last_slot"]+i+1
+                        print('INF: Slot '+str(missing_slot)+' not found in any relays'' payload. Requesting consensus layer endpoint.')
 
-                    # check if we've reached the end epoch and need to update variables
-                    if sync_committee_metrics:
-                        if missing_slot == next_sync_start_epoch * 32 or missing_slot > next_sync_start_epoch * 32:
-                            check_sync_committee(list(validators_index_key_mappings.keys()), missing_slot)
+                        # check if we've reached the end epoch and need to update variables
+                        if sync_committee_metrics:
+                            if missing_slot == next_sync_start_epoch * 32 or missing_slot > next_sync_start_epoch * 32:
+                                check_sync_committee(list(validators_index_key_mappings.keys()), missing_slot)
 
-                    # get slot and reward value, and update metrics
-                    data, reward = get_non_relayed_slot(missing_slot)
-                    if reward_metrics:
-                        print('Slot: '+str(missing_slot)+'\tReward: '+str(reward))
-                    else:
-                        print('Slot: '+str(missing_slot))
-                    update_metrics(data, reward)
-                    insert_new_slot(data['slot'], data['proposer'], data['relay'], data['missed'], data['empty'], reward)
+                        # get slot and reward value, and update metrics
+                        data, reward = get_non_relayed_slot(missing_slot)
+                        if reward_metrics:
+                            print('INF: Slot: '+str(missing_slot)+'\tReward: '+str(reward))
+                        else:
+                            print('INF: Slot: '+str(missing_slot))
+                        update_metrics(data, reward)
+                        insert_new_slot(data['slot'], data['proposer'], data['relay'], data['missed'], data['empty'], reward)
 
-                    if reward_metrics:
-                        # update reward metrics and append slot to data_obj
-                        update_reward_metrics(data["relay"], reward)
-                    data_obj["slots"].append(data)
+                        if reward_metrics:
+                            # update reward metrics and append slot to data_obj
+                            update_reward_metrics(data["relay"], reward)
+                        data_obj["slots"].append(data)
 
-            # check if we've reached the end epoch and need to update variables
-            if sync_committee_metrics:
-                if slot["slot"] == next_sync_start_epoch * 32 or slot["slot"] > next_sync_start_epoch * 32:
-                    check_sync_committee(list(validators_index_key_mappings.keys()), slot["slot"])
+                # check if we've reached the end epoch and need to update variables
+                if sync_committee_metrics:
+                    if slot["slot"] == next_sync_start_epoch * 32 or slot["slot"] > next_sync_start_epoch * 32:
+                        check_sync_committee(list(validators_index_key_mappings.keys()), slot["slot"])
 
-            # if slot is in relayer data, fill in data
-            data = {
-                "slot": slot["slot"],
-                "proposer": slot["proposer_pubkey"] if "proposer_pubkey" in slot else slot["proposer"],
-                "relay": slot["relay"],
-                "missed": False,
-                "empty": False if (slot["value"] / 1000000000000000000) > 0.0 else check_if_empty(slot["slot"])
-            }
+                # if slot is in relayer data, fill in data
+                data = {
+                    "slot": slot["slot"],
+                    "proposer": slot["proposer_pubkey"] if "proposer_pubkey" in slot else slot["proposer"],
+                    "relay": slot["relay"],
+                    "missed": False,
+                    "empty": False if (slot["value"] / 1000000000000000000) > 0.0 else check_if_empty(slot["slot"])
+                }
 
-            # if we're tracking sync committee participation, update metrics
-            if sync_committee_metrics:
-                update_sync_committee_performance(slot=slot["slot"])
+                # if we're tracking sync committee participation, update metrics
+                if sync_committee_metrics:
+                    update_sync_committee_performance(slot=slot["slot"])
 
-            # reward value is in slot data, divide to get ETH value
-            reward = slot["value"] / 1000000000000000000
-            print('Slot: '+str(slot["slot"])+'\tReward: '+str(reward))
-            data_obj["slots"].append(data)
-            data_obj["last_slot"] = slot["slot"]
+                # reward value is in slot data, divide to get ETH value
+                reward = slot["value"] / 1000000000000000000
+                print('INF: Slot: '+str(slot["slot"])+'\tReward: '+str(reward))
+                data_obj["slots"].append(data)
+                data_obj["last_slot"] = slot["slot"]
 
-            insert_new_slot(data['slot'], data['proposer'], data['relay'], data['missed'], data['empty'], reward)
+                insert_new_slot(data['slot'], data['proposer'], data['relay'], data['missed'], data['empty'], reward)
 
-            # update metrics and reward metrics
-            update_metrics(data, reward)
-            
-            if reward_metrics:
-                update_reward_metrics(data["relay"], reward)
+                # update metrics and reward metrics
+                update_metrics(data, reward)
+                
+                if reward_metrics:
+                    update_reward_metrics(data["relay"], reward)
 
-    # if pruning is enabled, then prune
-    if config['pruning']:
-        prune_db(config['keep_last_slots'])
+        update_upcoming_block_proposals(data_obj["last_slot"])
+        update_block_prop_metrics(data_obj["last_slot"])
 
-    # sleep for 20s
-    time.sleep(20)
+        # if pruning is enabled, then prune
+        if options['prune']:
+            prune_db(options['keep_last_slots'])
+
+        # sleep for 20s
+        time.sleep(20)
+
+if __name__ == "__main__":
+    
+    # get command-line options
+    arguments = sys.argv[1:]
+
+    # ensure that the correct options were passed
+    try:
+        opts, args = getopt.getopt(arguments, "hc:v", ["help", "config=", "version", "relay_config=", "port=", "pubkeys_file=", "pubkeys=", "eth1_rpc=", "eth1_parallel", "eth2_rpc=", "eth2_parallel", "rewards", "sync_committee", "prune", "keep_last_slots=", "last_slot="])
+    except Exception as e:
+        print("ERR: Incorrect options passed: "+str(e))
+        exit()
+
+    # show a warning when options that did not require a value were given one
+    if len(args) > 0:
+        print('WARN: Some command-line options that did not require a value were given a value. As a result, the following arguments will be ignored:', end=' ')
+        print(*args, sep=", ", end=". ")
+        print('To fix this, remove the value given to the "'+opts[-1][0]+'" option: "'+args[0]+'".')
+
+    # declare a dict to hold the options
+    options = {
+        'config': None,
+        'relay_config': None,
+        'port': None,
+        'pubkeys_file': None,
+        'pubkeys': None,
+        'eth1_rpc': None,
+        'eth1_parallel': None,
+        'eth2_rpc': None,
+        'eth2_parallel': None,
+        'rewards': None,
+        'sync_committee': None,
+        'prune': None,
+        'keep_last_slots': None,
+        'last_slot': None
+    }
+    
+    # iterate over the arguments and perform an action based on each
+    for opt, arg in opts:
+        if opt == '-h' or opt == '--help':
+            print("""Options and arguments:
+
+HELP
+-h --help\t\t:  print this help message
+-v --version\t\t:  outputs the version of the tool
+
+CONFIG
+-c --config\t\t:  the path to config.json (optional if options are provided through command-line)
+--relay_config\t\t:  the path to the relay config, containing the names and endpoints of the relays to query
+--port\t\t\t:  the port on which the Prometheus metrics will be published
+--pubkeys_file\t\t:  the path to a comma-separated list of the public keys of the validators that the script will monitor (optional if --pubkeys is used)
+--pubkeys\t\t:  a string of comma-separated public keys of the validators that the script will monitor (optional if --pubkeys_file is used)
+
+ENDPOINTS
+--eth1_rpc\t\t:  an endpoint of an execution-layer node that will be used for reward metrics (not needed if reward metrics are not enabled)
+--eth1_parallel\t\t:  enables parallel requests to the execution-layer node
+--eth2_rpc\t\t:  an endpoint of a consensus-layer node
+--eth2_parallel\t\t:  enables parallel requests to the consensus-layer node
+
+FEATURES
+--rewards\t\t:  enables reward metrics
+--sync_committee\t:  enables sync committee participation metrics
+--prune\t\t\t:  enable pruning of the slots table
+--keep_last_slots\t:  how many slots to keep if pruning is enabled, defaults to the last 100
+--last_slot\t\t:  the slot to attempt to continue (or start) syncing from. Defaults to 0 which is the (current slot - 100) or the last slot in the database""")
+            exit()
+        elif opt == '-c' or opt == '--config':
+            if not exists(arg):
+                print('ERR: Path passed for --config "'+str(arg)+'" is not valid, or the file does not exist.')
+                exit()
+            options['config'] = arg
+        elif opt == '-v' or opt == '--version':
+            print("ETH Block Proposal Monitor v0.3")
+            exit()
+        elif opt == '--relay_config':
+            if not exists(arg):
+                print('ERR: Path passed for --relay_config "'+str(arg)+'" is not valid, or the file does not exist.')
+                exit()
+            options['relay_config'] = arg
+        elif opt == '--port':
+            try:
+                options['port'] = int(arg)
+            except:
+                print('ERR: Port number passed for --port "'+str(arg)+'" is not a valid integer.')
+                exit()
+        elif opt == '--pubkeys_file':
+            if not exists(arg):
+                print('ERR: Path passed for --pubkeys_file "'+str(arg)+'" is not valid, or the file does not exist.')
+                exit()
+            options['pubkeys_file'] = arg
+        elif opt == '--pubkeys':
+            options['pubkeys'] = arg
+        elif opt == '--eth1_rpc':
+            if not check_endpoint_validity_eth1(arg):
+                print('ERR: Endpoint passed for --eth1_rpc "'+str(arg)+'" did not return a successful response. Ensure the endpoint is correct, and that the node is a fully-synced execution layer node.')
+                exit()
+            options['eth1_rpc'] = arg
+        elif opt == '--eth1_parallel':
+            options['eth1_parallel'] = True
+        elif opt == '--eth2_rpc':
+            if not check_endpoint_validity_eth2(arg):
+                print('ERR: Endpoint passed for --eth2_rpc "'+str(arg)+'" did not return a successful response. Ensure the endpoint is correct, and that the node is a fully-synced consensus layer node that supports the Beacon Node API spec (https://ethereum.github.io/beacon-APIs/).')
+                exit()
+            options['eth2_rpc'] = arg
+        elif opt == '--eth2_parallel':
+            options['eth2_parallel'] = True
+        elif opt == '--rewards':
+            options['rewards'] = True
+        elif opt == '--sync_committee':
+            options['sync_committee'] = True
+        elif opt == '--prune':
+            options['prune'] = True
+        elif opt == '--keep_last_slots':
+            try:
+                options['keep_last_slots'] = int(arg)
+            except:
+                print('ERR: Value passed for --keep_last_slots "'+str(arg)+'" is not a valid integer.')
+                exit()
+        elif opt == '--last_slot':
+            try:
+                options['last_slot'] = int(arg)
+            except:
+                print('ERR: Value passed for --last_slot "'+str(arg)+'" is not a valid integer.')
+                exit()
+
+    # in case a config file was passed, parse it
+    if options['config'] is not None:
+        options = read_config_update_options(options)
+    
+    # change any options which were not passed to the default value
+    options = none_to_default(options)
+    
+    global keys
+
+    # read the keys, either from the command-line option or from file
+    if options['pubkeys'] is not None:
+        keys = read_keys_from_str(options['pubkeys'])
+    else:
+        keys = read_keys_from_file(options['pubkeys_file'])
+
+    # call the main function and pass all the options
+    main(options)
