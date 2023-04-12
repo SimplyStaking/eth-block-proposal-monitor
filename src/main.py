@@ -1735,8 +1735,11 @@ def main(options: dict):
         # initialise upcoming sync committee participations metrics if sync committee metrics are enabled
         upcoming_sync_comm_part_gauge = Gauge("UpcomingSyncCommitteeParticipations", 'The epoch at which the validator will start participating in the sync committee for 256 epochs.', ["public_key"], registry=collector)
 
-    # initialise upcoming block proposals & sync committee participations metrics
+    # initialise upcoming block proposals metric
     upcoming_block_prop_gauge = Gauge("UpcomingBlockProposal", 'The slot number at which the validator is proposing a block.', ["public_key"], registry=collector)
+
+    # initialise current slot metric
+    current_slot_gauge = Gauge("CurrentSlotNumber", 'The latest slot number.', registry=collector)
 
     REGISTRY.register(collector)
 
@@ -1747,6 +1750,10 @@ def main(options: dict):
     while True: 
         # get all the slots from all the relays
         slots = get_all_payloads_parallel()
+
+        # update the current slot number
+        if len(slots) > 0:
+            current_slot_gauge.set(slots[-1]['slot'])
 
         for slot in slots:
             if slot["slot"] > data_obj["last_slot"]:

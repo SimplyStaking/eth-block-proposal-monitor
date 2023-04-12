@@ -103,3 +103,4 @@ The tool contains the following list of Prometheus metrics:
 14. `CurrentSyncCommitteeEpoch{epoch} -> int`: If metric value is 1, it is the starting epoch of the current sync committee, if it is 0, then it is the starting epoch of the previous sync committee. This metric is mostly used for the Grafana dashboard.
 15. `UpcomingBlockProposal{public_key} -> int`: The slot number at which the validator will propose a block.
 16. `UpcomingSyncCommitteeParticipations{public_key} -> int`: The epoch at which the validator will start participating in the sync committee.
+17. `CurrentSlotNumber -> int`: The latest slot number that the tool processed.
