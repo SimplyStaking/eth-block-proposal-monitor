@@ -1220,7 +1220,8 @@ def insert_validator_indexes(key_index_mapping: dict):
 
     # add the validator index to each validator
     for key, index in key_index_mapping.items():
-        cur.execute('UPDATE validators SET val_index = ? WHERE public_key = ?', (index, key))
+        if index is not None:
+            cur.execute('UPDATE validators SET val_index = ? WHERE public_key = ?', (index, key))
 
     con.commit()
     con.close()

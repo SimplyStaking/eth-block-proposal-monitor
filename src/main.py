@@ -343,11 +343,18 @@ def get_validator_indexes_parallel(public_keys: list) -> dict:
 
                     # try to get the validator index
                     data = s.get(eth2_rpc+"/eth/v1/beacon/states/"+str(curr_slot)+"/validators/"+key, timeout=30).json()
-                    data = data['data']['index']
-
-                    # if we got it, append it as a dict where the key is the public key, and the value is the index
-                    self.results.append({key: data})
-                    self.queue.task_done()
+                    if 'data' in data:
+                        if 'index' in data['data']:
+                            data = data['data']['index']
+                            # if we got it, append it as a dict where the key is the public key, and the value is the index
+                            self.results.append({key: data})
+                            self.queue.task_done()
+                        else:
+                            self.results.append({key: None})
+                            self.queue.task_done()
+                    else:
+                        self.results.append({key: None})
+                        self.queue.task_done()
                 except Exception as e:
                     print("WARN: ETH2 request failed - get_validator_indexes_parallel(): "+e)
                     self.results.append({key: None})
@@ -418,7 +425,11 @@ def get_validator_index(slot: int, key: str) -> int:
     # attempt the request
     try:
         data = s.get(eth2_rpc+"/eth/v1/beacon/states/"+str(slot)+"/validators/"+key, timeout=60).json()
-        return data['data']['index']
+        if 'data' in data:
+            if 'index' in data['data']:
+                return data['data']['index']
+        else:
+            return None
     except Exception as e:
         raise Exception("Failed to get validator index (get_validator_index()): "+e)
 
@@ -508,9 +519,7 @@ def check_sync_committee(validator_indexes: list, curr_slot: int = 0):
     if curr_sync_committee != {}:
         # if this is not the first time setting these variables, set the past committee as the current
         prev_sync_committee = curr_sync_committee
-    else:
-        # if this is the first time setting these variables, get the past committee as well
-        prev_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch-256)
+    
     curr_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch)
     next_sync_committee = get_validator_committee_index(validator_indexes, next_sync_start_epoch)
 
