@@ -490,6 +490,11 @@ def read_config_update_options(options: dict) -> dict:
                 print('ERR: Path in config file ("'+str(options['config'])+'") for "relay_config" "'+str(config['relay_config'])+'" is not valid, or the file does not exist.')
                 exit()
             new_options['relay_config'] = config['relay_config']
+        elif option == 'db' and value is None and 'db' in config:
+            if not exists(config['db']):
+                print('ERR: Path in config file ("'+str(options['config'])+'") for "db" "'+str(config['db'])+'" is not valid, or the file does not exist.')
+                exit()
+            new_options['db'] = config['db']
     
     return new_options
     
@@ -553,6 +558,10 @@ def none_to_default(options: dict) -> dict:
             print('WARN: Values were passed for both "pubkeys" and "pubkeys_file". Only keys passed through "pubkeys" will be considered.')
         elif option == "eth1_rpc" and value is not None and (options['rewards'] is None or options['rewards'] is False):
             print('WARN: An execution layer endpoint was provided but reward metrics were not enabled.')
+        elif option == "db" and value is None:
+            if not exists(getcwd()+'/../data/slot_data.db'):
+                print('WARN: No value was passed for option "db" and the database was not found in the default location ("'+getcwd()+'/../data/slot_data.db"). A new database will be created.')
+            new_options['db'] = getcwd()+'/../data/slot_data.db'
 
     return new_options
 

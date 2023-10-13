@@ -4,6 +4,18 @@ from os.path import dirname
 
 database_name = dirname(__file__)+'/../data/slot_data.db'
 
+def set_db_path(path: str):
+    """
+    Sets the global database path variable
+
+    Parameters:
+    -----------
+    path : str
+        The path of where the database is
+    """
+    global database_name
+    database_name = path
+
 def initialise_db(keys: list, relay_config: dict):
     """
     Initialises the database by calling several functions

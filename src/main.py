@@ -360,7 +360,7 @@ def get_validator_indexes_parallel(public_keys: list) -> dict:
                     self.results.append({key: None})
                     self.queue.task_done()
     
-    num_workers = 50
+    num_workers = 20
     q = Queue()
 
     # add each key in the queue
@@ -488,7 +488,7 @@ def check_sync_committee(validator_indexes: list, curr_slot: int = 0):
     curr_slot : int
         The current slot
     """
-    global config, retries, prev_sync_committee, curr_sync_committee, next_sync_committee, curr_sync_start_epoch, next_sync_start_epoch, val_sync_participated_gauge, val_sync_missed_gauge, validators_index_key_mappings, current_sync_committee_epoch_gauge
+    global config, retries, prev_sync_committee, curr_sync_committee, next_sync_committee, curr_sync_start_epoch, next_sync_start_epoch, val_sync_participated_gauge, val_sync_missed_gauge, validators_index_key_mappings, current_sync_committee_epoch_gauge, next_sync_updated
 
     # remove old committee metrics
     for val_index in prev_sync_committee:
@@ -519,18 +519,35 @@ def check_sync_committee(validator_indexes: list, curr_slot: int = 0):
     if curr_sync_committee != {}:
         # if this is not the first time setting these variables, set the past committee as the current
         prev_sync_committee = curr_sync_committee
-    
-    curr_sync_committee = get_validator_committee_index(validator_indexes, curr_sync_start_epoch)
+
+    curr_sync_committee = get_validator_committee_index(validator_indexes, curr_slot//32)
+
+    # initialise the metrics for the current committee to 0
+    for val_index in curr_sync_committee:
+        val_sync_participated_gauge.labels(validators_index_key_mappings[val_index], curr_sync_start_epoch).set(0)
+        val_sync_missed_gauge.labels(validators_index_key_mappings[val_index], curr_sync_start_epoch).set(0)
+
+    next_sync_updated = False
+
+def update_next_sync_committee_metrics(validator_indexes: list):
+    """
+    Populates the global variables with the upcoming sync commitee info
+
+    Parameters:
+    -----------
+    validator_indexes : list
+        A list of the validator indexes of our validators
+    """
+    global next_sync_committee, next_sync_start_epoch, next_sync_updated
+
     next_sync_committee = get_validator_committee_index(validator_indexes, next_sync_start_epoch)
 
     # update upcoming sync committee metrics
     update_upcoming_sync_committee_participations(next_sync_start_epoch)
     update_upcoming_sync_committee_part_metrics(next_sync_start_epoch)
 
-    # initialise the metrics for the current committee to 0
-    for val_index in curr_sync_committee:
-        val_sync_participated_gauge.labels(validators_index_key_mappings[val_index], curr_sync_start_epoch).set(0)
-        val_sync_missed_gauge.labels(validators_index_key_mappings[val_index], curr_sync_start_epoch).set(0)
+    next_sync_updated = True
+
 
 def check_sync_performance_slot(slot: int = 0, slot_data: dict = {}) -> dict:
     """
@@ -1601,10 +1618,13 @@ def main(options: dict):
         The CLI options (or from config.json) that configure the script
     """
     # defining global variables
-    global data_obj, data, keys, eth1_rpc, eth2_rpc, slots_limit, reward_metrics, sync_committee_metrics, parallel_requests, relay_config, keys, validators_index_key_mappings, prev_sync_committee, curr_sync_committee, next_sync_committee, curr_sync_start_epoch, next_sync_start_epoch, upcoming_proposals, upcoming_sync_committee, retries
+    global data_obj, data, keys, eth1_rpc, eth2_rpc, slots_limit, reward_metrics, sync_committee_metrics, parallel_requests, relay_config, keys, validators_index_key_mappings, prev_sync_committee, curr_sync_committee, next_sync_committee, curr_sync_start_epoch, next_sync_start_epoch, upcoming_proposals, upcoming_sync_committee, retries, next_sync_updated
 
     # defining global variables for metrics
     global relay_blocks_gauge, validator_totals_gauge, missed_gauge, empty_gauge, total_relay_blocks_gauge, total_rewards_gauge, avg_reward_gauge, unknown_reward_blocks,val_total_rewards_gauge, val_avg_reward_gauge, val_unknown_reward_blocks, val_sync_participated_gauge, val_sync_missed_gauge, current_sync_committee_epoch_gauge, upcoming_block_prop_gauge, upcoming_sync_comm_part_gauge
+
+    # set the database path global variable
+    set_db_path(options['db'])
 
     # initialise data object to hold slots and metrics
     data_obj = {
@@ -1647,7 +1667,7 @@ def main(options: dict):
     relay_config = json.load(f)
 
     # check if we have a db
-    if isfile(getcwd()+'/../data/slot_data.db'):
+    if isfile(options['db']):
         data = update_db(keys, relay_config)
     else:
         data = initialise_db(keys, relay_config)
@@ -1725,6 +1745,11 @@ def main(options: dict):
     missed_gauge = Gauge("MissedBlockProposals", 'Missed Blocks Proposals by each validator', ["public_key"], registry=collector)
     empty_gauge = Gauge("EmptyBlockProposals", 'Empty Blocks Proposals by each validator', ["public_key"], registry=collector)
     total_relay_blocks_gauge = Gauge("TotalRelayBlocksProposed", 'Total number of blocks relayed by each relay', ["relay"], registry=collector)
+    active_keys_gauge = Gauge("ActivePubKeys", 'Total number of keys that are currently being monitored', ["active"], registry=collector)
+
+    # initialise the active keys gauge
+    active_keys_gauge.labels("yes").set(len(validators_index_key_mappings.keys()))
+    active_keys_gauge.labels("no").set(len(keys) - len(validators_index_key_mappings.keys()))
 
     # reward metrics
     if reward_metrics:
@@ -1783,6 +1808,10 @@ def main(options: dict):
 
                         if participated != {}:
                             set_sync_committee_metrics(participated, missed, curr_sync_start_epoch)
+                    if not next_sync_updated and slot["slot"] > ((curr_sync_start_epoch * 32) + 200):
+                        # if 20 minutes have passed since the start of the current sync committee, it should be safe to query the rpc for the next sync committee
+                        update_next_sync_committee_metrics(list(validators_index_key_mappings.keys()))
+
 
                 # if we skipped slots - get data manually through rpc
                 if data_obj["last_slot"] != 0 and slot["slot"] != data_obj["last_slot"] + 1:
@@ -1875,6 +1904,7 @@ if __name__ == "__main__":
     options = {
         'config': None,
         'relay_config': None,
+        'db': None,
         'port': None,
         'pubkeys_file': None,
         'pubkeys': None,
@@ -1976,6 +2006,11 @@ FEATURES
             except:
                 print('ERR: Value passed for --last_slot "'+str(arg)+'" is not a valid integer.')
                 exit()
+        elif opt == '--db':
+            if not exists(arg):
+                print('ERR: Path passed for --db "'+str(arg)+'" is not valid, or the file does not exist.')
+                exit()
+            options['db'] = arg
 
     # in case a config file was passed, parse it
     if options['config'] is not None:
