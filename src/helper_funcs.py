@@ -492,8 +492,7 @@ def read_config_update_options(options: dict) -> dict:
             new_options['relay_config'] = config['relay_config']
         elif option == 'db' and value is None and 'db' in config:
             if not exists(config['db']):
-                print('ERR: Path in config file ("'+str(options['config'])+'") for "db" "'+str(config['db'])+'" is not valid, or the file does not exist.')
-                exit()
+                print('WARN: Could not find database in the path provided in the config file ("'+str(options['config'])+'"), option "db" "'+str(config['db'])+'". Generating new database in the same location.')
             new_options['db'] = config['db']
     
     return new_options
